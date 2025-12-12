@@ -12,12 +12,13 @@ class Neo4jDatabase:
         
     def connect(self):
         try:
-            self._driver = GraphDatabase.driver(self._uri, self._auth)
+            self._driver = GraphDatabase.driver(self._uri, auth=self._auth)
             self._driver.verify_connectivity()
             print("Neo4j Database Connected!!!!")
         except Exception as e:
             print(f"Failed to Connect to Neo4j: {e}")
             self._driver = None
+            raise e
     
     def close(self):
         if self._driver:
@@ -60,38 +61,38 @@ class Neo4jDatabase:
             t.url = $track_url,
             t.duration_ms = $duration_ms
         
-        // Use UNWIND to handle multiple artists and their genres
-        WITH u, t
-        UNWIND $artists AS artist_data
-        MERGE (a:Artist {id: artist_data.id})
-        ON CREATE SET 
-            a.name = artist_data.name, 
-            a.url = artist_data.url
-        MERGE (t)-[:PERFORMED_BY]->(a)
-        
-        FOREACH (gName IN artist_data.genres |
-            MERGE (g:Genre {name: gName})
-            MERGE (a)-[:HAS_GENRE]->(g)
+        // Use FOREACH to handle artists so we don't drop the row if the list is empty
+        FOREACH (artist_data IN $artists |
+            MERGE (a:Artist {id: artist_data.id})
+            ON CREATE SET 
+                a.name = artist_data.name, 
+                a.url = artist_data.url
+            MERGE (t)-[:PERFORMED_BY]->(a)
+            
+            FOREACH (gName IN artist_data.genres |
+                MERGE (g:Genre {name: gName})
+                MERGE (a)-[:HAS_GENRE]->(g)
+            )
         )
-
+        
+        WITH u, t
+        OPTIONAL MATCH (t)-[:PERFORMED_BY]->(a:Artist)
         WITH u, t, COLLECT(a) AS trackArtists
 
         // Create/update collaboration relationships with frequency count
         FOREACH (artist1 IN trackArtists |
             FOREACH (artist2 IN trackArtists |
                 // Use internal node IDs to avoid self-loops and duplicate relationships
-                WHERE id(artist1) < id(artist2)
-                MERGE (artist1)-[r:COLLABORATED_WITH]-(artist2)
-                ON CREATE SET r.count = 1
-                ON MATCH SET r.count = r.count + 1
+                FOREACH (_ IN CASE WHEN elementId(artist1) < elementId(artist2) THEN [1] ELSE [] END |
+                    MERGE (artist1)-[r:COLLABORATED_WITH]->(artist2)
+                    ON CREATE SET r.count = 1
+                    ON MATCH SET r.count = r.count + 1
+                )
             )
         )
 
-        // Use a CALL subquery for conditional album logic. It's cleaner than the FOREACH hack.
-        CALL {
-            WITH t // Importing WITH to bring t into the subquery scope
-            // This subquery only executes if albumId is not null
-            WHERE $albumId IS NOT NULL
+        // Use FOREACH for conditional album logic to avoid dropping rows if album is missing
+        FOREACH (_ IN CASE WHEN $albumId IS NOT NULL THEN [1] ELSE [] END |
             MERGE (al:Album {id: $albumId})
             ON CREATE SET
                  al.name = $album_name,
@@ -101,13 +102,12 @@ class Neo4jDatabase:
                  al.total_tracks = $album_total_tracks
             MERGE (t)-[:BELONGS_TO_ALBUM]->(al)
 
-            // Unwind the album's primary artists and connect them to the album
-            WITH al
-            UNWIND $album_artists AS album_artist_data
-            MERGE (aa:Artist {id: album_artist_data.id})
-            ON CREATE SET aa.name = album_artist_data.name, aa.url = album_artist_data.url
-            MERGE (aa)-[:HAS_ALBUM]->(al)
-        }
+            FOREACH (album_artist_data IN $album_artists |
+                MERGE (aa:Artist {id: album_artist_data.id})
+                ON CREATE SET aa.name = album_artist_data.name, aa.url = album_artist_data.url
+                MERGE (aa)-[:HAS_ALBUM]->(al)
+            )
+        )
         
         WITH u, t
         MERGE (le:ListenEvent {id: $listenEventId})
@@ -192,10 +192,12 @@ class Neo4jDatabase:
         WITH [d IN range(0, duration.inDays(startDate, endDate).days + 1) | startDate + duration({days: d})] AS dates
         UNWIND dates AS d
 
+        WITH d, ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"][d.month-1] AS monthName
+
         // Create or find Year, Month, and Day nodes
         MERGE (year:Year {year: d.year})
         MERGE (month:Month {month: d.month})
-        ON CREATE SET month.name = d.monthName
+        ON CREATE SET month.name = monthName
         MERGE (day:Day {date: d})
         ON CREATE SET day.day = d.day
 

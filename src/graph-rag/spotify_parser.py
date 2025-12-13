@@ -147,12 +147,15 @@ class SpotifyParser:
                 
                 if missing_artist_ids:
                     try:
-                        artists_response = self.sp.artists(missing_artist_ids)
-                        for artist in artists_response['artists']:
-                            if artist:
-                                genres = artist.get('genres', [])
-                                known_artists[artist['id']] = genres if genres else []
-                                new_artists_for_db[artist['id']] = genres if genres else []
+                        # Chunk artist IDs because a batch of 50 tracks might yield >50 artists
+                        for k in range(0, len(missing_artist_ids), 50):
+                            chunk_artist_ids = missing_artist_ids[k:k+50]
+                            artists_response = self.sp.artists(chunk_artist_ids)
+                            for artist in artists_response['artists']:
+                                if artist:
+                                    genres = artist.get('genres', [])
+                                    known_artists[artist['id']] = genres if genres else []
+                                    new_artists_for_db[artist['id']] = genres if genres else []
                     except Exception as e:
                         print(f"Error fetching artists: {e}")
 
@@ -253,5 +256,4 @@ class SpotifyParser:
             "album_artists": [],
             "album_total_tracks": None
         }
-        
         

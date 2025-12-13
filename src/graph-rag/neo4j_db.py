@@ -196,7 +196,7 @@ class Neo4jDatabase:
 
         // Create or find Year, Month, and Day nodes
         MERGE (year:Year {year: d.year})
-        MERGE (month:Month {month: d.month})
+        MERGE (month:Month {month: d.month, year: d.year})
         ON CREATE SET month.name = monthName
         MERGE (day:Day {date: d})
         ON CREATE SET day.day = d.day

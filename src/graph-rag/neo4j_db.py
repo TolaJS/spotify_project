@@ -76,20 +76,6 @@ class Neo4jDatabase:
         )
         
         WITH u, t
-        OPTIONAL MATCH (t)-[:PERFORMED_BY]->(a:Artist)
-        WITH u, t, COLLECT(a) AS trackArtists
-
-        // Create/update collaboration relationships with frequency count
-        FOREACH (artist1 IN trackArtists |
-            FOREACH (artist2 IN trackArtists |
-                // Use internal node IDs to avoid self-loops and duplicate relationships
-                FOREACH (_ IN CASE WHEN elementId(artist1) < elementId(artist2) THEN [1] ELSE [] END |
-                    MERGE (artist1)-[r:COLLABORATED_WITH]->(artist2)
-                    ON CREATE SET r.count = 1
-                    ON MATCH SET r.count = r.count + 1
-                )
-            )
-        )
 
         // Use FOREACH for conditional album logic to avoid dropping rows if album is missing
         FOREACH (_ IN CASE WHEN $albumId IS NOT NULL THEN [1] ELSE [] END |
@@ -154,6 +140,29 @@ class Neo4jDatabase:
         }
 
         self._execute_query(query, parameters)
+
+    def build_artist_collaborations(self):
+        """
+        Build all artist collaboration relationships after ingestion.
+        This counts unique tracks that artists have collaborated on together.
+        Should be called once after all listening events have been ingested.
+        """
+        print("Building artist collaboration relationships...")
+        query = """
+        MATCH (t:Track)-[:PERFORMED_BY]->(a1:Artist)
+        MATCH (t)-[:PERFORMED_BY]->(a2:Artist)
+        WHERE elementId(a1) < elementId(a2)
+        WITH a1, a2, count(DISTINCT t) as collabCount
+        MERGE (a1)-[r:COLLABORATED_WITH]->(a2)
+        SET r.count = collabCount
+        RETURN count(r) as relationshipsCreated
+        """
+        result = self._execute_query(query)
+        if result:
+            count = result[0].get('relationshipsCreated', 0)
+            print(f"-> Created/updated {count} collaboration relationships.")
+        else:
+            print("-> Collaboration relationships built.")
 
     def get_user_playlist(self):
         pass

@@ -49,43 +49,56 @@ class Neo4jDatabase:
         print("Constraints created.")
     
     def ingest_listening_event(self, user: Dict[str, Any], event_data: Dict[str, Any]):
+        # Skip processing if track name is empty
+        if not event_data.get('track_name'):
+            return
+
         query = """
         MERGE (u:User {id: $userId})
         ON CREATE SET
             u.name = $user_name,
             u.url = $user_url
-        
-        MERGE (t:Track {id: $trackId})
-        ON CREATE SET 
+
+        // Merge track using ISRC if available, otherwise fall back to Spotify ID
+        MERGE (t:Track {id: COALESCE($isrc, $trackId)})
+        ON CREATE SET
             t.name = $track_name,
             t.url = $track_url,
-            t.duration_ms = $duration_ms
-        
+            t.duration_ms = $duration_ms,
+            t.isrc = $isrc,
+            t.spotify_id = $trackId
+        ON MATCH SET
+            // Update spotify_id if this is a new ID for the same ISRC
+            t.spotify_id = COALESCE(t.spotify_id, $trackId)
+
         // Use FOREACH to handle artists so we don't drop the row if the list is empty
         FOREACH (artist_data IN $artists |
             MERGE (a:Artist {id: artist_data.id})
-            ON CREATE SET 
-                a.name = artist_data.name, 
+            ON CREATE SET
+                a.name = artist_data.name,
                 a.url = artist_data.url
             MERGE (t)-[:PERFORMED_BY]->(a)
-            
+
             FOREACH (gName IN artist_data.genres |
                 MERGE (g:Genre {name: gName})
                 MERGE (a)-[:HAS_GENRE]->(g)
             )
         )
-        
+
         WITH u, t
 
         // Use FOREACH for conditional album logic to avoid dropping rows if album is missing
         FOREACH (_ IN CASE WHEN $albumId IS NOT NULL THEN [1] ELSE [] END |
-            MERGE (al:Album {id: $albumId})
+            // Merge album using UPC if available, otherwise fall back to Spotify ID
+            MERGE (al:Album {id: COALESCE($upc, $albumId)})
             ON CREATE SET
                  al.name = $album_name,
                  al.type = $album_type,
                  al.url = $album_url,
                  al.release_date = $album_release_date,
-                 al.total_tracks = $album_total_tracks
+                 al.total_tracks = $album_total_tracks,
+                 al.upc = $upc,
+                 al.spotify_id = $albumId
             MERGE (t)-[:BELONGS_TO_ALBUM]->(al)
 
             FOREACH (album_artist_data IN $album_artists |
@@ -100,8 +113,11 @@ class Neo4jDatabase:
         ON CREATE SET
             le.timestamp = $ts,
             le.ms_played = $ms_played,
-            le.skipped = $skipped
-        
+            le.skipped = $skipped,
+            le.incognito = $incognito,
+            le.is_valid_listen = $is_valid_listen,
+            le.is_full_listen = $is_full_listen
+
         MERGE (u)-[:PERFORMED]->(le)
         MERGE (le)-[:IS_LISTEN_OF]->(t)
 
@@ -117,6 +133,11 @@ class Neo4jDatabase:
             f"{user.get('id')}_{event_data.get('trackId')}_{event_data.get('ts')}"
         )
 
+        # Calculate listen quality thresholds
+        ms_played = event_data.get("ms_played", 0)
+        is_valid_listen = ms_played >= 10000  # 10 seconds minimum
+        is_full_listen = ms_played >= 30000   # 30 seconds for a full listen
+
         parameters = {
             "listenEventId": listen_event_id,
             "userId": user['id'],
@@ -125,10 +146,12 @@ class Neo4jDatabase:
             "ts": event_data.get('ts'),
             "trackId": event_data.get("trackId"),
             "skipped": event_data.get("skipped"),
+            "incognito": event_data.get("incognito", False),
             "track_name": event_data.get("track_name"),
             "track_url":  event_data.get("track_url"),
-            "ms_played": event_data.get("ms_played"),
+            "ms_played": ms_played,
             "duration_ms": event_data.get("duration_ms"),
+            "isrc": event_data.get("isrc"),
             "artists": event_data.get("artists", []),
             "albumId": event_data.get("albumId"),
             "album_type": event_data.get("album_type"),
@@ -136,7 +159,10 @@ class Neo4jDatabase:
             "album_url": event_data.get("album_url"),
             "album_release_date": event_data.get("album_release_date"),
             "album_artists": event_data.get("album_artists", []),
-            "album_total_tracks": event_data.get("album_total_tracks")
+            "album_total_tracks": event_data.get("album_total_tracks"),
+            "upc": event_data.get("upc"),
+            "is_valid_listen": is_valid_listen,
+            "is_full_listen": is_full_listen
         }
 
         self._execute_query(query, parameters)

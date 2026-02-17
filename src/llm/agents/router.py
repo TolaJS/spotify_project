@@ -1,233 +1,112 @@
+"""Router Agent - Single LLM call for query analysis and routing."""
+
 import json
 import re
-from typing import Optional
-from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage
 
-from ..schemas.state_schemas import RouterState, SubQuery, ExecutionStep
-from ..prompts.router_prompts import (
-    QUERY_CLEANUP_PROMPT,
-    MULTI_PART_DETECTION_PROMPT,
-    QUERY_DECOMPOSITION_PROMPT,
-    ROUTE_CLASSIFICATION_PROMPT,
-)
-from ..utils.config import get_llm
+from ..schemas.state_schemas import RouterState, ExecutionStep
+from ..prompts.router_prompts import UNIFIED_ROUTER_PROMPT
+from ..utils.config import get_gemini_llm
+
+# TODO add logging to capture response_text incase parsing fails
+def get_response_text(response) -> str:
+    """Extract text content from LLM response, handling different formats."""
+    content = response.content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", str(part)) if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return str(content)
 
 
 def parse_json_response(content: str) -> dict:
-    """Parse JSON from LLM response, handling markdown code blocks.
-
-    Args:
-        content: Raw LLM response that may contain ```json ... ``` blocks
-
-    Returns:
-        Parsed JSON as dict
-
-    Raises:
-        json.JSONDecodeError: If JSON parsing fails
-    """
-    # Strip markdown code blocks if present
+    """Parse JSON from LLM response, handling markdown code blocks."""
     content = content.strip()
     if content.startswith("```"):
-        # Remove opening ```json or ```
         content = re.sub(r"^```(?:json)?\s*\n?", "", content)
-        # Remove closing ```
         content = re.sub(r"\n?```\s*$", "", content)
-
     return json.loads(content)
 
 
 class RouterAgent:
-    """LangGraph-based router for Spotify queries.
+    """Router class for user queries using a single LLM call.
 
     Routes queries to either:
     - graph_rag: Historical analysis via Neo4j
-    - mcp: Live Spotify operations
+    - spotify: Live Spotify operations
 
-    Handles multi-part queries by decomposing and routing each part.
+    Handles multi-part queries by decomposing and routing in one step.
     """
 
     def __init__(self, llm=None):
-        self.llm = llm or get_llm()
-        self.graph = self._build_graph()
-
-    def _build_graph(self) -> StateGraph:
-        """Construct the router graph."""
-        graph = StateGraph(RouterState)
-
-        # Add nodes
-        graph.add_node("clean_query", self._clean_query)
-        graph.add_node("detect_multi_part", self._detect_multi_part)
-        graph.add_node("decompose_query", self._decompose_query)
-        graph.add_node("classify_routes", self._classify_routes)
-        graph.add_node("build_plan", self._build_execution_plan)
-
-        # Set entry point
-        graph.set_entry_point("clean_query")
-
-        # Define edges
-        graph.add_edge("clean_query", "detect_multi_part")
-        graph.add_conditional_edges(
-            "detect_multi_part",
-            self._should_decompose,
-            {"decompose": "decompose_query", "classify": "classify_routes"},
-        )
-        graph.add_edge("decompose_query", "classify_routes")
-        graph.add_edge("classify_routes", "build_plan")
-        graph.add_edge("build_plan", END)
-
-        return graph.compile()
-
-    def _clean_query(self, state: RouterState) -> dict:
-        """Clean and normalize the user query."""
-        prompt = QUERY_CLEANUP_PROMPT.format(query=state["original_query"])
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-        return {"cleaned_query": response.content.strip()}
-
-    def _detect_multi_part(self, state: RouterState) -> dict:
-        """Detect if query contains multiple independent parts."""
-        prompt = MULTI_PART_DETECTION_PROMPT.format(query=state["cleaned_query"])
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-
-        try:
-            result = parse_json_response(response.content)
-            is_multi_part = result.get("is_multi_part", False)
-        except json.JSONDecodeError:
-            is_multi_part = False
-
-        return {"is_multi_part": is_multi_part}
-
-    def _decompose_query(self, state: RouterState) -> dict:
-        """Decompose a multi-part query into sub-queries."""
-        prompt = QUERY_DECOMPOSITION_PROMPT.format(query=state["cleaned_query"])
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-
-        try:
-            result = parse_json_response(response.content)
-            sub_queries = [
-                SubQuery(
-                    original_text=sq["text"],
-                    cleaned_text=sq["text"],
-                    route=None,
-                    depends_on=sq.get("depends_on"),
-                    context_needed=sq.get("context_needed"),
-                )
-                for sq in result.get("sub_queries", [])
-            ]
-        except json.JSONDecodeError:
-            # Fallback: treat as single query
-            sub_queries = [
-                SubQuery(
-                    original_text=state["cleaned_query"],
-                    cleaned_text=state["cleaned_query"],
-                    route=None,
-                    depends_on=None,
-                    context_needed=None,
-                )
-            ]
-
-        return {"sub_queries": sub_queries}
-
-    def _classify_routes(self, state: RouterState) -> dict:
-        """Classify each query/sub-query to the appropriate system."""
-        # If no sub_queries yet, create one from cleaned_query
-        sub_queries = state.get("sub_queries") or [
-            SubQuery(
-                original_text=state["cleaned_query"],
-                cleaned_text=state["cleaned_query"],
-                route=None,
-                depends_on=None,
-                context_needed=None,
-            )
-        ]
-
-        classified = []
-        for sq in sub_queries:
-            prompt = ROUTE_CLASSIFICATION_PROMPT.format(
-                query=sq["cleaned_text"],
-                context=sq.get("context_needed") or "None",
-            )
-            response = self.llm.invoke([HumanMessage(content=prompt)])
-
-            try:
-                result = parse_json_response(response.content)
-                route = result.get("route", "graph_rag")
-            except json.JSONDecodeError:
-                route = "graph_rag"  # Default fallback
-
-            classified.append(
-                SubQuery(
-                    original_text=sq["original_text"],
-                    cleaned_text=sq["cleaned_text"],
-                    route=route,
-                    depends_on=sq.get("depends_on"),
-                    context_needed=sq.get("context_needed"),
-                )
-            )
-
-        return {"sub_queries": classified}
-
-    def _build_execution_plan(self, state: RouterState) -> dict:
-        """Build an ordered execution plan from classified sub-queries."""
-        sub_queries = state["sub_queries"]
-
-        # Topological sort based on dependencies
-        plan = []
-        executed = set()
-
-        while len(executed) < len(sub_queries):
-            for i, sq in enumerate(sub_queries):
-                if i in executed:
-                    continue
-
-                dep = sq.get("depends_on")
-                if dep is None or dep in executed:
-                    plan.append(
-                        ExecutionStep(
-                            step=len(plan),
-                            query=sq["cleaned_text"],
-                            route=sq["route"],
-                            depends_on=dep,
-                            context_needed=sq.get("context_needed"),
-                        )
-                    )
-                    executed.add(i)
-
-        return {"execution_plan": plan, "current_step": 0}
-
-    def _should_decompose(self, state: RouterState) -> str:
-        """Conditional edge: route to decompose or directly to classify."""
-        return "decompose" if state["is_multi_part"] else "classify"
+        self.llm = llm or get_gemini_llm()
 
     def route(self, query: str) -> RouterState:
-        """Route a user query through the graph.
+        """Route a user query with a single LLM call.
 
         Args:
             query: Raw user input
 
         Returns:
-            RouterState with execution_plan populated
+            RouterState with a populated execution_plan list
         """
-        initial_state: RouterState = {
-            "original_query": query,
-            "cleaned_query": "",
-            "is_multi_part": False,
-            "sub_queries": [],
-            "execution_plan": [],
-            "current_step": 0,
-            "intermediate_results": {},
-            "final_response": None,
-        }
-        return self.graph.invoke(initial_state)
+        prompt = UNIFIED_ROUTER_PROMPT.format(query=query)
+        response = self.llm.invoke([HumanMessage(content=prompt)])
+        response_text = get_response_text(response)
 
+        try:
+            result = parse_json_response(response_text)
 
-def create_router(llm=None) -> RouterAgent:
-    """Factory function to create a RouterAgent.
+            cleaned_query = result.get("cleaned_query", query)
+            raw_plan = result.get("execution_plan", [])
 
-    Args:
-        llm: Optional LLM instance to use
+            # Convert to ExecutionStep objects
+            execution_plan = []
+            for step_data in raw_plan:
+                execution_plan.append(
+                    ExecutionStep(
+                        step=step_data.get("step", len(execution_plan)),
+                        query=step_data.get("query", ""),
+                        route=step_data.get("route", "graph_rag"),
+                        depends_on=step_data.get("depends_on"),
+                        context_needed=step_data.get("context_needed"),
+                    )
+                )
 
-    Returns:
-        Configured RouterAgent
-    """
-    return RouterAgent(llm=llm)
+            # Handle empty plan - create single step
+            if not execution_plan:
+                execution_plan = [
+                    ExecutionStep(
+                        step=0,
+                        query=cleaned_query,
+                        route="graph_rag",
+                        depends_on=None,
+                        context_needed=None,
+                    )
+                ]
+
+        except json.JSONDecodeError:
+            # Fallback: single graph_rag step with original query
+            cleaned_query = query
+            execution_plan = [
+                ExecutionStep(
+                    step=0,
+                    query=query,
+                    route="graph_rag",
+                    depends_on=None,
+                    context_needed=None,
+                )
+            ]
+
+        return RouterState(
+            original_query=query,
+            cleaned_query=cleaned_query,
+            is_multi_part=len(execution_plan) > 1,
+            sub_queries=[],  # Not used in unified approach
+            execution_plan=execution_plan,
+            current_step=0,
+            intermediate_results={},
+            final_response=None,
+        )
+

@@ -103,7 +103,6 @@ class RouterAgent:
             original_query=query,
             cleaned_query=cleaned_query,
             is_multi_part=len(execution_plan) > 1,
-            sub_queries=[],  # Not used in unified approach
             execution_plan=execution_plan,
             current_step=0,
             intermediate_results={},

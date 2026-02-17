@@ -3,14 +3,6 @@ from typing import TypedDict, List, Literal, Optional, Any
 RouteType = Literal["graph_rag", "spotify"]
 
 
-class SubQuery(TypedDict):
-    """A decomposed sub-query with routing information."""
-    original_text: str
-    cleaned_text: str
-    route: Optional[RouteType]
-    depends_on: Optional[int]  # Index of sub-query this depends on
-    context_needed: Optional[str]  # What context is needed from dependency
-
 
 class ExecutionStep(TypedDict):
     """A single step in the execution plan."""
@@ -29,7 +21,6 @@ class RouterState(TypedDict):
     # Processing
     cleaned_query: str
     is_multi_part: bool
-    sub_queries: List[SubQuery]
 
     # Execution
     execution_plan: List[ExecutionStep]

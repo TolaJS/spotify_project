@@ -1,6 +1,5 @@
 from .state_schemas import (
     RouterState,
-    SubQuery,
     ExecutionStep,
     RouteType,
     QueryResult,
@@ -15,7 +14,6 @@ from .state_schemas import (
 
 __all__ = [
     "RouterState",
-    "SubQuery",
     "ExecutionStep",
     "RouteType",
     "QueryResult",

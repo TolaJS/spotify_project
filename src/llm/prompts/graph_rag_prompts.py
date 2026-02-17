@@ -102,29 +102,6 @@ Respond with a JSON object:
 Only output valid JSON, no markdown."""
 
 
-RESULT_INTERPRETATION_PROMPT = """You are interpreting results from a Spotify listening history database query.
-
-Original question: {query}
-
-Cypher query executed:
-```cypher
-{cypher}
-```
-
-Query results:
-{results}
-
-Provide a natural language answer to the user's question based on these results. Be specific and include relevant details like:
-- Artist/track names
-- Listen counts or percentages
-- Time periods mentioned
-- Any interesting patterns
-
-Keep the response concise but informative. If the results are empty, explain that no data was found for the query criteria.
-
-Response:"""
-
-
 QUERY_REFINEMENT_PROMPT = """The following Cypher query failed or returned unexpected results:
 
 Original question: {query}

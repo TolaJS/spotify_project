@@ -1,5 +1,6 @@
 """Response Synthesis Agent - Combines results into coherent responses."""
 
+import json
 from typing import List
 from langchain_core.messages import HumanMessage
 
@@ -27,7 +28,7 @@ def get_response_text(response) -> str:
 class SynthesisAgent:
     """Agent for combining execution results into coherent user responses.
 
-    Uses Gemini to synthesize results from Graph RAG and MCP queries
+    Uses Gemini to synthesize results from Graph RAG and Spotify agent queries
     into natural language responses.
     """
 
@@ -111,11 +112,9 @@ class SynthesisAgent:
 
     def _synthesize_multi(self, state: SynthesisState) -> str:
         """Synthesize multiple independent results."""
+        # Use _format_single_result to include actual data, not just interpretation
         sub_query_results = "\n\n".join(
-            f"### Query {i+1}: {r['query']}\n"
-            f"Route: {r['route']}\n"
-            f"Success: {r['result']['success']}\n"
-            f"Result: {r['result']['interpretation']}"
+            f"### Query {i+1}\n{self._format_single_result(r)}"
             for i, r in enumerate(state["step_results"])
         )
 
@@ -131,14 +130,14 @@ class SynthesisAgent:
         """Synthesize chained results (data lookup → action)."""
         results = state["step_results"]
 
-        # Find the data step (usually graph_rag) and action step (usually mcp)
+        # Find the data step (usually graph_rag) and action step (usually spotify)
         data_result = None
         action_result = None
 
         for r in results:
             if r["route"] == "graph_rag":
                 data_result = r
-            elif r["route"] == "mcp":
+            elif r["route"] == "spotify":
                 action_result = r
 
         # Fallback if routes don't match expected pattern
@@ -164,18 +163,16 @@ class SynthesisAgent:
 
         for r in results:
             if r["result"]["success"]:
-                partial_results.append(
-                    f"- {r['query']}: {r['result']['interpretation']}"
-                )
+                partial_results.append(self._format_single_result(r))
             else:
                 error_details.append(
-                    f"- {r['query']}: {r['result']['interpretation']}"
+                    f"Query: {r['query']}\nError: {r['result']['interpretation']}"
                 )
 
         prompt = ERROR_SYNTHESIS_PROMPT.format(
             original_query=state["original_query"],
-            error_details="\n".join(error_details) if error_details else "No specific errors recorded",
-            partial_results="\n".join(partial_results) if partial_results else "None",
+            error_details="\n\n".join(error_details) if error_details else "No specific errors recorded",
+            partial_results="\n\n".join(partial_results) if partial_results else "None",
         )
 
         response = self.llm.invoke([HumanMessage(content=prompt)])
@@ -183,12 +180,35 @@ class SynthesisAgent:
 
     def _format_single_result(self, result: StepResult) -> str:
         """Format a single step result for the prompt."""
+        data = result['result'].get('data', [])
+        route = result['route']
+
+        # Format data based on route type
+        if route == "graph_rag":
+            # Neo4j returns list of dicts
+            if data:
+                data_str = json.dumps(data[:10], indent=2, default=str)
+                if len(data) > 10:
+                    data_str += f"\n... and {len(data) - 10} more results"
+            else:
+                data_str = "No data returned"
+        elif route == "spotify":
+            # Spotify agent returns list of tool results with 'result' strings
+            if data:
+                data_str = "\n".join([
+                    f"Tool: {d.get('tool', 'unknown')}\nOutput: {d.get('result', 'N/A')}"
+                    for d in data
+                ])
+            else:
+                data_str = "No tool results"
+        else:
+            data_str = str(data)
+
         return (
             f"Query: {result['query']}\n"
-            f"Route: {result['route']}\n"
+            f"Route: {route}\n"
             f"Success: {result['result']['success']}\n"
-            f"Result: {result['result']['interpretation']}\n"
-            f"Data: {result['result'].get('data', [])}"
+            f"Data:\n{data_str}"
         )
 
 

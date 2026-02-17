@@ -2,29 +2,22 @@
 
 import json
 import re
-from typing import Optional, Any
 from neo4j import GraphDatabase
-from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage
 
-from ..schemas.state_schemas import GraphRAGState, QueryResult
+from ..schemas.state_schemas import QueryResult
 from ..prompts.graph_rag_prompts import (
     SCHEMA_DESCRIPTION,
     CYPHER_GENERATION_PROMPT,
-    RESULT_INTERPRETATION_PROMPT,
     QUERY_REFINEMENT_PROMPT,
 )
 from ..utils.config import get_gemini_llm, get_neo4j_config
 
 
 def get_response_text(response) -> str:
-    """Extract text content from LLM response, handling different formats.
-
-    Gemini may return content as a list of parts, while OpenAI returns a string.
-    """
+    """Extract text content from LLM response."""
     content = response.content
     if isinstance(content, list):
-        # Gemini format: list of content parts
         return "".join(
             part.get("text", str(part)) if isinstance(part, dict) else str(part)
             for part in content
@@ -42,19 +35,19 @@ def parse_json_response(content: str) -> dict:
 
 
 class GraphRAGAgent:
-    """LangGraph-based agent for querying Spotify listening history via Neo4j.
+    """Agent for querying Spotify listening history via Neo4j.
 
-    Uses Gemini to:
-    1. Generate Cypher queries from natural language
-    2. Execute queries against Neo4j
-    3. Interpret results in natural language
+    General Flow:
+    1. Generate Cypher query from natural language
+    2. Execute against Neo4j
+    3. Retry up to 2 times if query fails
+    4. Return raw results (Synthesis agent handles interpretation)
     """
 
     def __init__(self, llm=None, neo4j_config: dict = None):
         self.llm = llm or get_gemini_llm()
         self.neo4j_config = neo4j_config or get_neo4j_config()
         self._driver = None
-        self.graph = self._build_graph()
 
     def _get_driver(self):
         """Lazy initialization of Neo4j driver."""
@@ -71,118 +64,54 @@ class GraphRAGAgent:
             self._driver.close()
             self._driver = None
 
-    def _build_graph(self) -> StateGraph:
-        """Construct the Graph RAG processing graph."""
-        graph = StateGraph(GraphRAGState)
+    def _generate_cypher(self, query: str, context: str = None) -> tuple[str, str]:
+        """Generate Cypher query from natural language.
 
-        # Add nodes
-        graph.add_node("generate_cypher", self._generate_cypher)
-        graph.add_node("execute_query", self._execute_query)
-        graph.add_node("interpret_results", self._interpret_results)
-        graph.add_node("refine_query", self._refine_query)
-
-        # Set entry point
-        graph.set_entry_point("generate_cypher")
-
-        # Define edges
-        graph.add_edge("generate_cypher", "execute_query")
-        graph.add_conditional_edges(
-            "execute_query",
-            self._should_refine,
-            {"refine": "refine_query", "interpret": "interpret_results"},
-        )
-        graph.add_edge("refine_query", "execute_query")
-        graph.add_edge("interpret_results", END)
-
-        return graph.compile()
-
-    def _generate_cypher(self, state: GraphRAGState) -> dict:
-        """Generate Cypher query from natural language."""
+        Returns:
+            Tuple of (cypher_query, error_message)
+        """
         prompt = CYPHER_GENERATION_PROMPT.format(
             schema=SCHEMA_DESCRIPTION,
-            query=state["query"],
-            context=state.get("context") or "None",
+            query=query,
+            context=context or "None",
         )
         response = self.llm.invoke([HumanMessage(content=prompt)])
         response_text = get_response_text(response)
 
         try:
             result = parse_json_response(response_text)
-            return {
-                "cypher_query": result.get("cypher", ""),
-                "query_explanation": result.get("explanation", ""),
-                "return_type": result.get("return_type", "list"),
-            }
+            return result.get("cypher", ""), None
         except json.JSONDecodeError:
-            return {
-                "cypher_query": "",
-                "error": f"Failed to parse Cypher generation response: {response_text[:200]}",
-                "retry_count": state.get("retry_count", 0) + 1,
-            }
+            return "", f"Failed to parse response: {response_text[:200]}"
 
-    def _execute_query(self, state: GraphRAGState) -> dict:
-        """Execute the Cypher query against Neo4j."""
-        cypher = state.get("cypher_query", "")
+    def _execute_cypher(self, cypher: str) -> tuple[list, str]:
+        """Execute Cypher query against Neo4j.
+
+        Returns:
+            Tuple of (results, error_message)
+        """
         if not cypher:
-            return {
-                "raw_results": [],
-                "error": state.get("error") or "No Cypher query generated",
-            }
+            return [], "No Cypher query provided"
 
         try:
             driver = self._get_driver()
             with driver.session() as session:
                 result = session.run(cypher)
                 records = [record.data() for record in result]
-
-            return {
-                "raw_results": records,
-                "error": None,
-            }
+            return records, None
         except Exception as e:
-            return {
-                "raw_results": [],
-                "error": str(e),
-            }
+            return [], str(e)
 
-    def _interpret_results(self, state: GraphRAGState) -> dict:
-        """Interpret query results in natural language."""
-        results = state.get("raw_results", [])
+    def _refine_cypher(self, query: str, cypher: str, error: str) -> tuple[str, str]:
+        """Refine a failed Cypher query.
 
-        # Format results for the prompt
-        if not results:
-            results_str = "No results found."
-        elif len(results) > 20:
-            # Truncate for large result sets
-            results_str = json.dumps(results[:20], indent=2, default=str)
-            results_str += f"\n... and {len(results) - 20} more results"
-        else:
-            results_str = json.dumps(results, indent=2, default=str)
-
-        prompt = RESULT_INTERPRETATION_PROMPT.format(
-            query=state["query"],
-            cypher=state.get("cypher_query", ""),
-            results=results_str,
-        )
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-        response_text = get_response_text(response).strip()
-
-        return {
-            "interpreted_response": response_text,
-            "result": QueryResult(
-                success=True,
-                data=results,
-                interpretation=response_text,
-                cypher_used=state.get("cypher_query", ""),
-            ),
-        }
-
-    def _refine_query(self, state: GraphRAGState) -> dict:
-        """Refine a failed Cypher query."""
+        Returns:
+            Tuple of (refined_cypher, error_message)
+        """
         prompt = QUERY_REFINEMENT_PROMPT.format(
-            query=state["query"],
-            cypher=state.get("cypher_query", ""),
-            error=state.get("error", "Unknown error"),
+            query=query,
+            cypher=cypher,
+            error=error,
             schema=SCHEMA_DESCRIPTION,
         )
         response = self.llm.invoke([HumanMessage(content=prompt)])
@@ -190,74 +119,63 @@ class GraphRAGAgent:
 
         try:
             result = parse_json_response(response_text)
-            return {
-                "cypher_query": result.get("cypher", ""),
-                "query_explanation": result.get("explanation", ""),
-                "return_type": result.get("return_type", "list"),
-                "retry_count": state.get("retry_count", 0) + 1,
-                "error": None,
-            }
+            return result.get("cypher", ""), None
         except json.JSONDecodeError:
-            return {
-                "error": f"Failed to refine query: {response_text[:200]}",
-                "retry_count": state.get("retry_count", 0) + 1,
-            }
-
-    def _should_refine(self, state: GraphRAGState) -> str:
-        """Decide whether to refine the query or interpret results."""
-        error = state.get("error")
-        retry_count = state.get("retry_count", 0)
-
-        # Refine if there's an error and we haven't exceeded retry limit
-        if error and retry_count < 2:
-            return "refine"
-        return "interpret"
+            return "", f"Failed to refine query: {response_text[:200]}"
 
     def query(self, query: str, context: str = None) -> QueryResult:
         """Execute a natural language query against the listening history.
 
         Args:
-            query: Natural language question about listening history
-            context: Optional context from previous steps
+            query: Natural language question about listening history.
+            context: Optional string containing results from previous execution steps
+                     (e.g., "Artist: Taylor Swift") to resolve ambiguities like "by them".
 
         Returns:
-            QueryResult with data and interpretation
+            QueryResult with raw data (interpretation done by Synthesis agent)
         """
-        initial_state: GraphRAGState = {
-            "query": query,
-            "context": context,
-            "cypher_query": "",
-            "query_explanation": "",
-            "return_type": "",
-            "raw_results": [],
-            "interpreted_response": "",
-            "error": None,
-            "retry_count": 0,
-            "result": None,
-        }
+        # Step 1: Generate Cypher
+        cypher, error = self._generate_cypher(query, context)
 
-        final_state = self.graph.invoke(initial_state)
+        if error:
+            return QueryResult(
+                success=False,
+                data=[],
+                interpretation=error,
+                cypher_used="",
+            )
 
-        # Return the result or construct an error result
-        if final_state.get("result"):
-            return final_state["result"]
+        # Step 2: Execute with retry loop
+        max_retries = 2
+        results = []
+
+        for attempt in range(max_retries + 1):
+            results, error = self._execute_cypher(cypher)
+
+            if error is None:
+                break
+
+            if attempt < max_retries:
+                # Try to refine the query
+                cypher, refine_error = self._refine_cypher(query, cypher, error)
+                if refine_error:
+                    error = refine_error
+                    break
+
+        # Step 3: Return results
+        if error:
+            return QueryResult(
+                success=False,
+                data=[],
+                interpretation=f"Query error: {error}",
+                cypher_used=cypher,
+            )
+
+        interpretation = "No results found." if not results else f"Found {len(results)} result(s)."
 
         return QueryResult(
-            success=False,
-            data=[],
-            interpretation=final_state.get("error") or "Query failed",
-            cypher_used=final_state.get("cypher_query", ""),
+            success=True,
+            data=results,
+            interpretation=interpretation,
+            cypher_used=cypher,
         )
-
-
-def create_graph_rag_agent(llm=None, neo4j_config: dict = None) -> GraphRAGAgent:
-    """Factory function to create a GraphRAGAgent.
-
-    Args:
-        llm: Optional LLM instance (defaults to Gemini)
-        neo4j_config: Optional Neo4j config dict
-
-    Returns:
-        Configured GraphRAGAgent
-    """
-    return GraphRAGAgent(llm=llm, neo4j_config=neo4j_config)

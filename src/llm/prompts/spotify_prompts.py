@@ -1,4 +1,4 @@
-"""Prompts for the MCP Agent - Spotify live operations."""
+"""Prompts for the Spotify Agent - Spotify live operations."""
 
 TOOL_DESCRIPTIONS = """
 ## Available Spotify Tools
@@ -41,6 +41,11 @@ Parameters: None
 Add a track to the user's playback queue.
 Parameters:
 - track_uri (string, required): The Spotify URI of the track to add
+
+### start_playback
+Start playing a track, album, artist's discography, or playlist on the user's active device.
+Parameters:
+- uri (string, required): The Spotify URI to play (e.g. spotify:track:xxx, spotify:album:xxx, spotify:artist:xxx, spotify:playlist:xxx)
 """
 
 TOOL_SELECTION_PROMPT = """You are a Spotify assistant that selects the appropriate tool(s) to fulfill user requests.
@@ -69,30 +74,21 @@ Respond with a JSON object:
 }}
 
 Rules:
-1. If the user wants to play/queue a song but doesn't provide a URI, you need to search first
-2. For "add_to_queue", you need the track_uri - if not provided, search for it first
+1. If the user wants to play/queue a song but doesn't provide a Spotify URI (spotify:track:...), you MUST search first
+2. For "add_to_queue", you need the track_uri - if context has track names but no URIs, search for EACH track first
 3. For "add_to_playlist", you need both playlist_id and track_uris
 4. If multiple tools are needed, list them in execution order
-5. Only output valid JSON, no markdown code blocks
+5. When context contains multiple tracks (e.g., "top 5 songs"), include a search_spotify call for EACH track, followed by add_to_queue for EACH
+6. Only output valid JSON, no markdown code blocks
+7. When the user wants to PLAY multiple tracks, use start_playback for the FIRST track only, and add_to_queue for the remaining tracks. This ensures the first track plays immediately and the rest follow in order
+
+Example - if context has 3 tracks without URIs:
+{{"tools": [
+  {{"name": "search_spotify", "arguments": {{"query": "Track1 Artist1", "type": "track", "limit": 1}}, "reason": "Get URI for track 1"}},
+  {{"name": "search_spotify", "arguments": {{"query": "Track2 Artist2", "type": "track", "limit": 1}}, "reason": "Get URI for track 2"}},
+  {{"name": "search_spotify", "arguments": {{"query": "Track3 Artist3", "type": "track", "limit": 1}}, "reason": "Get URI for track 3"}}
+], "requires_search_first": true, "explanation": "Search for each track to get URIs, then queue them"}}
 """
-
-RESULT_INTERPRETATION_PROMPT = """You are interpreting results from Spotify API operations.
-
-User's original request: {query}
-
-Tool(s) executed: {tools_used}
-
-Results:
-{results}
-
-Provide a natural, conversational response to the user based on these results. Include:
-- Confirmation of what was done
-- Relevant details (track names, artist names, playlist names, etc.)
-- Any suggestions or follow-up actions if appropriate
-
-Keep the response concise but helpful. If there was an error, explain what went wrong.
-
-Response:"""
 
 MULTI_TOOL_PLANNING_PROMPT = """You need to execute multiple Spotify operations to fulfill this request.
 
@@ -118,7 +114,10 @@ Respond with a JSON object:
 }}
 
 Rules:
-1. Use information from previous results (like track URIs from search results)
-2. If the task is complete, set is_final to true and use "none" as the tool name
-3. Only output valid JSON, no markdown code blocks
+1. Use information from previous results - extract track URIs from search results (look for "URI: spotify:track:...")
+2. If previous results contain search results, use the URIs to call add_to_queue or add_to_playlist
+3. If multiple tracks need to be queued, call add_to_queue for EACH track URI found
+4. If the task is complete (all tracks queued/played), set is_final to true and use "none" as the tool name
+5. Only output valid JSON, no markdown code blocks
+6. When the user wants to PLAY multiple tracks, use start_playback for the FIRST track only, and add_to_queue for the remaining tracks. This ensures the first track plays immediately and the rest follow in order
 """

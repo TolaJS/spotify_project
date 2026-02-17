@@ -1,6 +1,6 @@
 from typing import TypedDict, List, Literal, Optional, Any
 
-RouteType = Literal["graph_rag", "mcp"]
+RouteType = Literal["graph_rag", "spotify"]
 
 
 class SubQuery(TypedDict):
@@ -41,7 +41,7 @@ class RouterState(TypedDict):
 
 
 class QueryResult(TypedDict):
-    """Result from a Graph RAG or MCP query."""
+    """Result from a Graph RAG or Spotify agent query."""
     success: bool
     data: List[Any]
     interpretation: str
@@ -78,8 +78,8 @@ class ToolCall(TypedDict):
     reason: Optional[str]
 
 
-class MCPState(TypedDict):
-    """State for the MCP agent."""
+class SpotifyAgentState(TypedDict):
+    """State for the Spotify agent."""
     # Input
     query: str
     context: Optional[str]  # Context from previous steps (e.g., track info from Graph RAG)

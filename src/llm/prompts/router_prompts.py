@@ -23,11 +23,11 @@ Determine if this query needs to be decomposed into multiple steps.
 
 This assistant has TWO systems:
 1. graph_rag - Historical analysis (top artists, listening trends, etc.)
-2. mcp - Live Spotify operations (play, search, queue, playlists)
+2. spotify - Live Spotify operations (play, search, queue, playlists)
 
 DECOMPOSE (is_multi_part = true) when:
 - Multiple independent requests: "What's my top artist AND what's playing now"
-- Cross-system operations: "Play my top song from last month" (needs graph_rag to find, mcp to play)
+- Cross-system operations: "Play my top song from last month" (needs graph_rag to find, spotify to play)
 - Action on historical data: "Add my top 10 songs to a playlist" (find + action)
 - Numbered/bulleted lists
 - "First... then...", "After that..."
@@ -56,7 +56,7 @@ Query: {query}
 
 Available operations:
 - Historical analysis (graph_rag): listening patterns, top artists/songs/genres over time, comparisons across periods
-- Live operations (mcp): current playback, search, playlist management, queue management
+- Live operations (spotify): current playback, search, playlist management, queue management
 
 Examples:
 
@@ -91,7 +91,7 @@ ROUTE_CLASSIFICATION_PROMPT = """You are a router for a Spotify music assistant 
    - "How many times did I listen to X"
    - Any query requiring aggregation over historical data
 
-2. **mcp** - Live Spotify operations via API
+2. **spotify** - Live Spotify operations via API
    - Current playback: "what's playing now"
    - Search Spotify catalog: "search for Taylor Swift"
    - Playlist management: create, add tracks, list playlists
@@ -99,7 +99,7 @@ ROUTE_CLASSIFICATION_PROMPT = """You are a router for a Spotify music assistant 
    - Recently played (last 50 tracks only via API)
    - Any action that modifies Spotify state
 
-Available MCP tools:
+Available Spotify tools:
 - search_spotify: Search for tracks, artists, or albums
 - create_playlist: Create a new playlist
 - add_to_playlist: Add tracks to a playlist
@@ -107,6 +107,7 @@ Available MCP tools:
 - recently_played: Get last 50 played tracks
 - current_playing: Get currently playing track
 - add_to_queue: Add track to playback queue
+- start_playback: Start playing a track, album, artist, or playlist
 
 Classify the following query:
 
@@ -115,7 +116,60 @@ Context from previous step (if any): {context}
 
 Respond with JSON only:
 {{
-    "route": "graph_rag" or "mcp",
+    "route": "graph_rag" or "spotify",
     "reasoning": "brief explanation",
-    "mcp_tool": "tool_name or null if graph_rag"
+    "spotify_tool": "tool_name or null if graph_rag"
+}}"""
+
+
+# Combined prompt for single LLM call routing
+UNIFIED_ROUTER_PROMPT = """You are a router for a Spotify music assistant. Analyze the query and create an execution plan in ONE step.
+
+## Available Systems
+
+1. **graph_rag** - Historical analysis using Neo4j
+   - Listening history, top artists/songs/genres, trends over time
+   - Year/month comparisons, genre analysis
+   - "How many times did I listen to X"
+
+2. **spotify** - Live Spotify operations
+   - current_playing: what's playing now
+   - search_spotify: search for tracks/artists/albums
+   - get_playlists: list user's playlists
+   - create_playlist: create a new playlist
+   - add_to_playlist: add tracks to playlist
+   - add_to_queue: add track to queue
+   - start_playback: play a track, album, artist, or playlist
+   - recently_played: last 50 played tracks
+
+## Task
+
+Analyze this query and create an execution plan:
+
+Query: {query}
+
+## Rules
+
+1. Clean the query (fix typos, expand abbreviations)
+2. Determine if it needs multiple steps:
+   - "What's my top artist AND what's playing" → 2 independent steps
+   - "Play my top song from last month" → 2 dependent steps (find then play)
+   - "Who is my top artist" → 1 step
+3. For each step, assign the correct route and include spotify_tool if applicable
+4. If step B needs data from step A, set depends_on to A's index
+
+## Response Format (JSON only, no markdown):
+
+{{
+    "cleaned_query": "normalized query",
+    "execution_plan": [
+        {{
+            "step": 0,
+            "query": "the sub-query or full query",
+            "route": "graph_rag" or "spotify",
+            "spotify_tool": "tool_name or null",
+            "depends_on": null or step_index,
+            "context_needed": null or "what data is needed from dependency"
+        }}
+    ]
 }}"""

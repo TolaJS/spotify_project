@@ -80,7 +80,8 @@ CYPHER_GENERATION_PROMPT = """You are a Cypher query expert for a Spotify listen
 
 6. **Always return useful fields:**
    - For artists: name, id, listen count
-   - For tracks: name, artist names, listen count
+   - For tracks: name, artist names, listen count, and t.spotify_id
+   - For albums: name, artist names, listen count, and al.spotify_id
    - For time analysis: the time period and counts
 
 ## Task

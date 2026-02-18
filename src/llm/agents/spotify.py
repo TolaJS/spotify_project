@@ -161,11 +161,11 @@ class SpotifyAgent:
     # -- Deterministic follow-up from search results --
 
     def _extract_uris_from_results(self, tool_results: list) -> list[str]:
-        """Extract Spotify track URIs from search result strings."""
+        """Extract Spotify URIs (track, artist, album) from search result strings."""
         uris = []
         for r in tool_results:
             if r.get("tool") == "search_spotify" and r.get("success"):
-                found = re.findall(r"spotify:track:[a-zA-Z0-9]+", r.get("result", ""))
+                found = re.findall(r"spotify:(?:track|artist|album):[a-zA-Z0-9]+", r.get("result", ""))
                 if found:
                     uris.append(found[0])
         return uris
@@ -173,14 +173,22 @@ class SpotifyAgent:
     def _try_deterministic_followup(self, query: str, context: str, tool_results: list) -> list[ToolCall]:
         """Build follow-up tool calls from search results without an LLM call.
 
-        If the query implies an action (queue/playlist) and search results contain
-        URIs, build the tool calls directly.
+        If the query implies an action (play/queue/playlist) and search results
+        contain URIs, build the tool calls directly.
         """
         query_lower = query.lower()
         uris = self._extract_uris_from_results(tool_results)
 
         if not uris:
             return []
+
+        # Play: start_playback for the first URI, add_to_queue for the rest
+        # Works for track, artist, and album URIs
+        if any(word in query_lower for word in ["play", "listen", "put on", "start"]):
+            tools = [ToolCall(name="start_playback", arguments={"uri": uris[0]}, reason=f"Play {uris[0]}")]
+            for uri in uris[1:]:
+                tools.append(ToolCall(name="add_to_queue", arguments={"track_uri": uri}, reason=f"Queue {uri}"))
+            return tools
 
         if "queue" in query_lower:
             return [

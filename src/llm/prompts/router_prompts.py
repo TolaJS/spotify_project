@@ -27,9 +27,12 @@ Query: {query}
 
 1. Clean the query (fix typos, expand abbreviations)
 2. Determine if it needs multiple steps:
-   - "What's my top artist AND what's playing" → 2 independent steps
-   - "Play my top song from last month" → 2 dependent steps (find then play)
-   - "Who is my top artist" → 1 step
+   - Only split into multiple steps when DIFFERENT systems are required
+   - "What's my top artist AND what's playing" → 2 independent steps (graph_rag + spotify)
+   - "Play my top song from last month" → 2 dependent steps: graph_rag to find the song, then spotify to play it
+   - "Play something by Brevin Kim" → 1 spotify step (spotify handles search-then-play internally, no graph_rag needed)
+   - "Who is my top artist" → 1 graph_rag step
+   - NEVER create two spotify steps — if only spotify is needed, always use a single spotify step
 3. For each step, assign the correct route and include spotify_tool if applicable
 4. If step B needs data from step A, set depends_on to A's index
 

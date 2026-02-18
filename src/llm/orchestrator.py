@@ -5,6 +5,8 @@ specific dependency's Future, not on an entire batch.
 """
 
 import json
+import logging
+import time
 import threading
 from typing import Optional, List, Dict
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -18,6 +20,8 @@ from .agents.router import RouterAgent
 from .agents.graph_rag import GraphRAGAgent
 from .agents.spotify import SpotifyAgent
 from .agents.synthesis import SynthesisAgent
+
+logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
@@ -39,14 +43,23 @@ class Orchestrator:
         self,
         step: ExecutionStep,
         completed_results: Dict[int, StepResult],
+        session_context: Optional[str] = None,
     ) -> StepResult:
         """Execute a single step, passing context from dependencies if any."""
         context = self._get_context_for_step(step, completed_results)
+        # Fall back to cross-turn session context when there is no within-turn dependency
+        if context is None and session_context:
+            context = session_context
+            logger.debug("Step %d (%s): using session context", step["step"], step["route"])
+        else:
+            logger.debug("Step %d (%s): context_from_dependency=%s", step["step"], step["route"], context is not None)
 
+        t0 = time.perf_counter()
         if step["route"] == "graph_rag":
             result = self.graph_rag.query(step["query"], context=context)
         else:
             result = self.spotify.query(step["query"], context=context)
+        logger.info("Step %d (%s) completed in %.2fs | success=%s", step["step"], step["route"], time.perf_counter() - t0, result["success"])
 
         return StepResult(
             step=step["step"],
@@ -84,7 +97,7 @@ class Orchestrator:
         return None
 
     def _execute_plan_parallel(
-        self, execution_plan: List[ExecutionStep]
+        self, execution_plan: List[ExecutionStep], session_context: Optional[str] = None
     ) -> List[StepResult]:
         """Execute all steps with per-dependency parallelism using Futures."""
         step_futures: Dict[int, Future] = {}
@@ -108,7 +121,7 @@ class Orchestrator:
                         results_snapshot = dict(completed_results)
 
                     # Run the agent (graph_rag or spotify)
-                    result = self._execute_single_step(s, results_snapshot)
+                    result = self._execute_single_step(s, results_snapshot, session_context)
 
                     # Store result for downstream steps
                     with lock:
@@ -143,14 +156,16 @@ class Orchestrator:
         all_results.sort(key=lambda r: r["step"])
         return all_results
 
-    def query(self, query: str) -> dict:
+    def query(self, query: str, session_context: Optional[str] = None) -> dict:
         """Process a user query through the full pipeline.
 
         Returns dict with 'response', 'success', and 'details'.
         """
         # 1. Route: analyze query and build execution plan
+        t0 = time.perf_counter()
         router_result = self.router.route(query)
         execution_plan = router_result["execution_plan"]
+        logger.info("Router completed in %.2fs | steps=%d plan=%s", time.perf_counter() - t0, len(execution_plan), [(s["step"], s["route"]) for s in execution_plan])
 
         if not execution_plan:
             return {
@@ -160,13 +175,17 @@ class Orchestrator:
             }
 
         # 2. Execute: run all steps in parallel (respecting dependencies)
-        all_results = self._execute_plan_parallel(execution_plan)
+        t1 = time.perf_counter()
+        all_results = self._execute_plan_parallel(execution_plan, session_context)
+        logger.info("All steps completed in %.2fs", time.perf_counter() - t1)
 
         # 3. Synthesize: combine results into a final response
+        t2 = time.perf_counter()
         final_response = self.synthesis.synthesize(
             original_query=query,
             step_results=all_results,
         )
+        logger.info("Synthesis completed in %.2fs", time.perf_counter() - t2)
 
         success = all(r["result"]["success"] for r in all_results)
 

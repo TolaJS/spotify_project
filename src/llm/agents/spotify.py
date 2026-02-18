@@ -1,6 +1,7 @@
 """Spotify Agent - Handles live Spotify operations via tool calls."""
 
 import json
+import logging
 import re
 from typing import Optional
 from langchain_core.messages import HumanMessage
@@ -12,6 +13,8 @@ from ..prompts.spotify_prompts import (
     MULTI_TOOL_PLANNING_PROMPT,
 )
 from ..utils.config import get_gemini_llm
+
+logger = logging.getLogger(__name__)
 
 
 def get_response_text(response) -> str:
@@ -237,18 +240,25 @@ class SpotifyAgent:
 
         items = []
         for record in data:
-            # Track results have spotify_id and a track name
-            spotify_id = record.get("spotify_id") or record.get("t.spotify_id")
-            name = record.get("name") or record.get("t.name") or record.get("track")
+            # Albums (al.spotify_id)
+            al_spotify_id = record.get("al.spotify_id")
+            if al_spotify_id:
+                name = record.get("name") or record.get("al.name")
+                items.append({"uri": f"spotify:album:{al_spotify_id}", "name": name or al_spotify_id})
+                continue
 
-            if spotify_id:
-                # Determine URI type — default to track since that's the most
-                # common case from Graph RAG queries
-                if record.get("al.spotify_id") or record.get("album_type"):
-                    uri = f"spotify:album:{spotify_id}"
-                else:
-                    uri = f"spotify:track:{spotify_id}"
-                items.append({"uri": uri, "name": name or spotify_id})
+            # Tracks (t.spotify_id or spotify_id)
+            t_spotify_id = record.get("t.spotify_id") or record.get("spotify_id")
+            if t_spotify_id:
+                name = record.get("name") or record.get("t.name") or record.get("track")
+                items.append({"uri": f"spotify:track:{t_spotify_id}", "name": name or t_spotify_id})
+                continue
+
+            # Artists — schema stores artist Spotify ID as `id`, `a.id`, or aliased as `artist_id`
+            artist_id = record.get("artist_id") or record.get("a.id") or record.get("id")
+            if artist_id:
+                name = record.get("artist_name") or record.get("name") or record.get("a.name")
+                items.append({"uri": f"spotify:artist:{artist_id}", "name": name or artist_id})
 
         return items
 
@@ -268,7 +278,9 @@ class SpotifyAgent:
             return None
 
         items = self._extract_spotify_ids_from_context(context)
+        logger.info("direct_playback_from_context: extracted %d item(s): %s", len(items), items)
         if not items:
+            logger.info("direct_playback_from_context: no items found, falling back to normal flow")
             return None
 
         # Build tool calls: for "play", first track gets start_playback and
@@ -282,7 +294,14 @@ class SpotifyAgent:
             tool_results.append(self._execute_tool(tool))
 
         success = all(r.get("success", False) for r in tool_results)
-        interpretation = f"Played {len(tool_results)} track(s) directly from listening history."
+        if not success:
+            failed = [r for r in tool_results if not r.get("success")]
+            error_summary = "; ".join(
+                f"{r['tool']} failed: {r['result']}" for r in failed
+            )
+            interpretation = f"{len(failed)} of {len(tool_results)} tool(s) failed — {error_summary}"
+        else:
+            interpretation = f"Played {len(tool_results)} item(s) directly from context."
 
         return QueryResult(
             success=success,
@@ -303,6 +322,7 @@ class SpotifyAgent:
         """
         # Fast path: if Graph RAG already gave us spotify_ids and the query
         # is about playing/queueing, skip search and LLM calls entirely
+        logger.info("SpotifyAgent.query: context present=%s | context_preview=%s", context is not None, (context or "")[:120])
         direct_result = self._try_direct_playback_from_context(query, context)
         if direct_result is not None:
             return direct_result
@@ -349,7 +369,16 @@ class SpotifyAgent:
 
         # Step 4: Return results
         success = all(r.get("success", False) for r in tool_results)
-        interpretation = "No results." if not tool_results else f"Executed {len(tool_results)} tool(s)."
+        if not tool_results:
+            interpretation = "No tools were executed."
+        elif not success:
+            failed = [r for r in tool_results if not r.get("success")]
+            error_summary = "; ".join(
+                f"{r['tool']} failed: {r['result']}" for r in failed
+            )
+            interpretation = f"{len(failed)} of {len(tool_results)} tool(s) failed — {error_summary}"
+        else:
+            interpretation = f"Executed {len(tool_results)} tool(s) successfully."
 
         return QueryResult(
             success=success,

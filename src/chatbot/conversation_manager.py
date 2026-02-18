@@ -1,8 +1,9 @@
 """Conversation Manager - Stateful session wrapper around the Orchestrator."""
 
+import json
 import time
 import uuid
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 from llm.orchestrator import Orchestrator
 from chatbot.query_rewriter import QueryRewriter
@@ -54,13 +55,15 @@ class ConversationManager:
         # Rewrite if this is a follow-up turn (history exists)
         rewritten_query: Optional[str] = None
         query_for_orchestrator = query
+        session_context: Optional[str] = None
 
         if session["turns"]:
             rewritten_query = self._rewriter.rewrite(query, session["turns"])
             query_for_orchestrator = rewritten_query
+            session_context = self._format_session_context(session["turns"])
 
         # Execute via Orchestrator
-        result = self._orchestrator.query(query_for_orchestrator)
+        result = self._orchestrator.query(query_for_orchestrator, session_context=session_context)
 
         # Record the turn
         turn = Turn(
@@ -69,6 +72,7 @@ class ConversationManager:
             response=result["response"],
             success=result["success"],
             timestamp=time.time(),
+            step_results=result["details"]["step_results"],
         )
         session["turns"].append(turn)
         session["last_active"] = time.time()
@@ -119,6 +123,34 @@ class ConversationManager:
     def _is_expired(self, session: Session) -> bool:
         """Check if a session has exceeded the inactivity timeout."""
         return (time.time() - session["last_active"]) > self._session_timeout
+
+    def _format_session_context(self, turns: List[Turn]) -> Optional[str]:
+        """Scan backwards through recent turns for the most recent graph_rag result with entity data.
+
+        Produces a string in the same format as _get_context_for_step so that
+        SpotifyAgent._try_direct_playback_from_context can extract URIs and skip
+        the search + tool-selection LLM call on follow-up playback queries.
+
+        Only graph_rag results are considered — they contain entity IDs (artist_id,
+        spotify_id) that the fast path can parse. Spotify results (search output,
+        playback confirmations) are skipped. A lookback limit of 3 turns ensures
+        stale context from much earlier in the conversation isn't used.
+        """
+        for turn in reversed(turns[-3:]):
+            for step in turn.get("step_results") or []:
+                if (
+                    step["route"] == "graph_rag"
+                    and step["result"]["success"]
+                    and step["result"].get("data")
+                ):
+                    data = step["result"]["data"]
+                    interpretation = step["result"].get("interpretation", "")
+                    context_parts = [f"Previous result: {interpretation}"]
+                    context_parts.append(f"Data ({len(data)} total items):")
+                    context_parts.append(json.dumps(data[:10], indent=2, default=str))
+                    return "\n".join(context_parts)
+
+        return None
 
     def _cleanup_expired(self):
         """Remove all expired sessions. Called lazily on each request."""

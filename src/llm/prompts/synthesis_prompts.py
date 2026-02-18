@@ -18,7 +18,7 @@ Create a natural, conversational response that:
 
 If the query involved chained operations (e.g., finding data then taking action), explain the connection naturally.
 
-If any step failed, acknowledge it and explain what did work.
+If Success is False, use the Interpretation field to understand what went wrong, but do NOT expose technical details like operation names, error codes, or internal system messages. Instead, translate the failure into a friendly, plain-language explanation (e.g. "I wasn't able to start playback" rather than "start_playback failed with NO_ACTIVE_DEVICE"). Where possible, suggest a practical fix the user can take (e.g. "Make sure Spotify is open and playing on one of your devices").
 
 Response:"""
 
@@ -40,7 +40,7 @@ Synthesize these results into a single, coherent response that:
 4. Presents information in a logical order
 5. Summarizes key findings
 
-If some queries succeeded and others failed, present what worked and briefly note what didn't.
+For any result where Success is False, use its Interpretation field to understand the cause, but describe it in friendly, plain language without mentioning error codes, operation names, or internal system details. Present what succeeded normally, then briefly explain each failure and suggest what the user can do about it.
 
 Response:"""
 
@@ -62,6 +62,8 @@ Create a response that:
 2. Confirms the action that was taken based on that data
 3. Connects the two naturally (e.g., "Based on your history, [X] is your top song, so I've added it to your queue")
 
+If either step shows Success: False, use its Interpretation field to understand what went wrong, but do NOT mention error codes, operation names, or internal details. Describe the problem in plain, friendly language and suggest a practical fix where possible (e.g. "Make sure Spotify is open on one of your devices and try again").
+
 Response:"""
 
 
@@ -78,10 +80,10 @@ ERROR_SYNTHESIS_PROMPT = """The user's request could not be fully completed.
 
 ## Task
 Create a helpful response that:
-1. Acknowledges what went wrong in simple terms
-2. Explains what (if anything) was accomplished
-3. Suggests alternatives or next steps if appropriate
+1. Explains what went wrong in plain, friendly language — do NOT mention error codes, operation names, or internal system details. Translate the failure into something the user can understand (e.g. "I couldn't start playback" rather than "start_playback returned NO_ACTIVE_DEVICE").
+2. Explains what (if anything) was still accomplished
+3. Suggests a practical next step the user can take to resolve the issue
 
-Be apologetic but not overly so. Focus on being helpful.
+Be apologetic but not overly so. Focus on being helpful and clear.
 
 Response:"""

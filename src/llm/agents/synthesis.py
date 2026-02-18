@@ -38,7 +38,7 @@ class SynthesisAgent:
         Args:
             llm: Optional LLM instance (defaults to Gemini)
         """
-        self.llm = llm or get_gemini_llm()
+        self.llm = llm or get_gemini_llm(temperature=0.4)
 
     def synthesize(
         self,
@@ -102,12 +102,6 @@ class SynthesisAgent:
         """Synthesize a single result."""
         result = state["step_results"][0]
 
-        # Fast path: skip LLM for simple Spotify action confirmations
-        if result["route"] == "spotify":
-            fast = self._try_fast_spotify_response(state["original_query"], result)
-            if fast:
-                return fast
-
         prompt = RESPONSE_SYNTHESIS_PROMPT.format(
             original_query=state["original_query"],
             execution_results=self._format_single_result(result),
@@ -151,16 +145,6 @@ class SynthesisAgent:
             data_result = results[0]
             action_result = results[-1]
 
-        # Fast path: if the Spotify step is a simple action, skip LLM
-        if action_result["route"] == "spotify":
-            fast_action = self._try_fast_spotify_response(
-                state["original_query"], action_result
-            )
-            if fast_action:
-                # Still need the data context — build a simple combined response
-                interpretation = data_result["result"].get("interpretation", "")
-                return f"{interpretation}\n\n{fast_action}"
-
         prompt = CHAINED_RESULT_SYNTHESIS_PROMPT.format(
             original_query=state["original_query"],
             data_result=self._format_single_result(data_result),
@@ -194,74 +178,6 @@ class SynthesisAgent:
         response = self.llm.invoke([HumanMessage(content=prompt)])
         return get_response_text(response).strip()
 
-    def _try_fast_spotify_response(self, query: str, result: StepResult) -> str | None:
-        """Generate a response for simple Spotify actions without an LLM call.
-
-        Handles playback, queue, and other straightforward action confirmations
-        where the tool result string already contains all the info needed.
-        Searches are ignored — only action results are used.
-
-        Returns:
-            A response string, or None to fall back to LLM synthesis.
-        """
-        data = result["result"].get("data", [])
-        if not data or not result["result"]["success"]:
-            return None
-
-        action_tools = {"start_playback", "add_to_queue", "add_to_playlist",
-                        "create_playlist"}
-        info_tools = {"current_playing", "recently_played", "get_playlists"}
-
-        # Filter to only action results (ignore searches used as intermediate steps)
-        action_results = [d for d in data if d.get("tool") in action_tools and d.get("success")]
-
-        # No actions taken — fall back to LLM (e.g. search-only or info queries)
-        if not action_results:
-            # Also check for info tools — these need LLM synthesis
-            return None
-
-        # Extract artist/track names from search results for richer messages
-        search_names = []
-        for d in data:
-            if d.get("tool") == "search_spotify" and d.get("success"):
-                # Pull the first result name from "Found N artist(s)/track(s) for 'X':\n1. Name\n"
-                lines = d.get("result", "").split("\n")
-                for line in lines:
-                    line = line.strip()
-                    if line and line[0].isdigit() and ". " in line:
-                        name = line.split(". ", 1)[1].strip()
-                        search_names.append(name)
-                        break
-
-        # Build a human-friendly confirmation
-        parts = []
-        for i, d in enumerate(action_results):
-            tool = d.get("tool")
-            result_str = d.get("result", "")
-
-            if tool == "start_playback" and "Started playback:" in result_str:
-                # Use the search name if available, otherwise show the URI
-                if search_names:
-                    parts.append(f"Now playing **{search_names[0]}**.")
-                else:
-                    uri = result_str.split("Started playback: ")[-1].strip()
-                    parts.append(f"Now playing `{uri}`.")
-            elif tool == "add_to_queue" and "Added track to queue:" in result_str:
-                name = search_names[i] if i < len(search_names) else None
-                if name:
-                    parts.append(f"Added **{name}** to your queue.")
-                else:
-                    uri = result_str.split("Added track to queue: ")[-1].strip()
-                    parts.append(f"Added `{uri}` to your queue.")
-            elif tool == "create_playlist":
-                parts.append(result_str)
-            elif tool == "add_to_playlist":
-                parts.append(result_str)
-            else:
-                parts.append(result_str)
-
-        return " ".join(parts) if parts else None
-
     def _format_single_result(self, result: StepResult) -> str:
         """Format a single step result for the prompt."""
         data = result['result'].get('data', [])
@@ -292,6 +208,7 @@ class SynthesisAgent:
             f"Query: {result['query']}\n"
             f"Route: {route}\n"
             f"Success: {result['result']['success']}\n"
+            f"Interpretation: {result['result']['interpretation']}\n"
             f"Data:\n{data_str}"
         )
 

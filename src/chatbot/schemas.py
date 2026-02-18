@@ -1,4 +1,4 @@
-from typing import TypedDict, Optional, List
+from typing import TypedDict, Optional, List, Any
 
 
 class Turn(TypedDict):
@@ -8,6 +8,7 @@ class Turn(TypedDict):
     response: str                   # the assistant's response text
     success: bool                   # from Orchestrator result
     timestamp: float                # time.time()
+    step_results: Optional[List[Any]]  # orchestrator step results, forwarded as context to next turn
 
 
 class Session(TypedDict):

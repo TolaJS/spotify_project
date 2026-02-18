@@ -118,18 +118,3 @@ class SynthesisState(TypedDict):
     final_response: str
 
 
-class OrchestratorState(TypedDict):
-    """State for the main Orchestrator."""
-    # Input
-    original_query: str
-
-    # Router output
-    execution_plan: List[ExecutionStep]
-
-    # Execution tracking
-    current_step: int
-    step_results: List[StepResult]
-
-    # Final output
-    final_response: str
-    success: bool

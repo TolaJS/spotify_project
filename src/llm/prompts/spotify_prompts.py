@@ -81,6 +81,7 @@ Rules:
 5. When context contains multiple tracks (e.g., "top 5 songs"), include a search_spotify call for EACH track, followed by add_to_queue for EACH
 6. Only output valid JSON, no markdown code blocks
 7. When the user wants to PLAY multiple tracks, use start_playback for the FIRST track only, and add_to_queue for the remaining tracks. This ensures the first track plays immediately and the rest follow in order
+8. If the user ONLY wants to search or find songs (no mention of playing, queueing, or listening), DO NOT plan queue or play actions. Only plan search calls.
 
 Example - if context has 3 tracks without URIs:
 {{"tools": [
@@ -115,9 +116,10 @@ Respond with a JSON object:
 
 Rules:
 1. Use information from previous results - extract track URIs from search results (look for "URI: spotify:track:...")
-2. If previous results contain search results, use the URIs to call add_to_queue or add_to_playlist
+2. If previous results contain search results AND the user explicitly requested to play/queue them, use the URIs to call add_to_queue or add_to_playlist
 3. If multiple tracks need to be queued, call add_to_queue for EACH track URI found
-4. If the task is complete (all tracks queued/played), set is_final to true and use "none" as the tool name
+4. If the task is complete (all requested tracks queued/played, or if the user ONLY asked to search/find without playing), set is_final to true and use "none" as the tool name
 5. Only output valid JSON, no markdown code blocks
 6. When the user wants to PLAY multiple tracks, use start_playback for the FIRST track only, and add_to_queue for the remaining tracks. This ensures the first track plays immediately and the rest follow in order
+7. CRITICAL: If the user ONLY asked to "search for", "find", or "show" songs, and did not ask to play or queue them, you MUST set is_final to true immediately after the search tool completes. DO NOT queue songs unless explicitly asked.
 """

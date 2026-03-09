@@ -240,6 +240,12 @@ class SpotifyAgent:
 
         items = []
         for record in data:
+            # If a full URI is already provided (e.g. from a Search result), respect it directly
+            full_uri = record.get("uri")
+            if full_uri:
+                items.append({"uri": full_uri, "name": record.get("name", "Unknown")})
+                continue
+
             # Albums (al.spotify_id)
             al_spotify_id = record.get("al.spotify_id")
             if al_spotify_id:
@@ -265,15 +271,17 @@ class SpotifyAgent:
     def _try_direct_playback_from_context(self, query: str, context: str) -> QueryResult | None:
         """Fast path: if context already has spotify_ids and the query implies
         playback, skip search entirely and play/queue directly.
+        
+        Uses semantic fuzzy-matching to select the best track if multiple exist.
 
         Returns:
             QueryResult if handled, None if this fast path doesn't apply.
         """
         query_lower = query.lower()
 
-        # Only trigger for playback-related queries
-        is_play = any(word in query_lower for word in ["play", "listen", "put on", "start"])
-        is_queue = "queue" in query_lower
+        # Only trigger for playback-related queries using explicit action intents from the Rewriter
+        is_play = query_lower.startswith("play")
+        is_queue = query_lower.startswith("queue")
         if not is_play and not is_queue:
             return None
 
@@ -283,10 +291,88 @@ class SpotifyAgent:
             logger.info("direct_playback_from_context: no items found, falling back to normal flow")
             return None
 
-        # Build tool calls: for "play", first track gets start_playback and
-        # the rest get add_to_queue. For "queue", all get add_to_queue.
+        # --- Semantic Matching to find the best item ---
+        # If there's only 1 item, just use it
+        if len(items) == 1:
+            best_items = items
+        else:
+            import difflib
+            
+            # Extract the actual entity name we are looking for (the rewriter puts it in quotes)
+            import re
+            match = re.search(r'"([^"]*)"', query)
+            target_name = match.group(1).lower() if match else query_lower
+            
+            target_type = None
+            if "artist" in query_lower: target_type = "artist"
+            elif "album" in query_lower: target_type = "album"
+            elif "playlist" in query_lower: target_type = "playlist"
+            elif "track" in query_lower or "song" in query_lower: target_type = "track"
+            
+            # Helper to score an item against the target name
+            def get_match_score(target, item):
+                item_name = item["name"]
+                item_uri = item["uri"]
+                
+                # 1. SequenceMatcher score (good for exact substring matches, but fails if words are reordered)
+                seq_score = difflib.SequenceMatcher(None, target, item_name.lower()).ratio()
+                
+                # 2. Word overlap score (good for catching "live" or "acoustic" modifiers)
+                stop_words = {"play", "listen", "to", "the", "a", "an", "of", "version", "on", "it", "one", "queue", "song", "track", "artist", "album", "playlist"}
+                q_words = set(target.split()) - stop_words
+                i_words = set(item_name.lower().split()) - stop_words
+                
+                if not q_words:
+                    word_score = 0
+                else:
+                    word_score = len(q_words.intersection(i_words)) / len(q_words)
+                    
+                score = (seq_score * 0.3) + (word_score * 0.7)
+                
+                # 3. Type match bonus
+                if target_type:
+                    if f":{target_type}:" in item_uri:
+                        score += 0.2  # Bonus for correct entity type
+                    else:
+                        score -= 0.1  # Slight penalty for wrong entity type
+                        
+                return score
+                
+            scored_items = [(item, get_match_score(target_name, item)) for item in items]
+            scored_items.sort(key=lambda x: x[1], reverse=True)
+            
+            logger.info("Semantic match scores: %s", scored_items)
+            
+            best_item, best_score = scored_items[0]
+            second_best_score = scored_items[1][1] if len(scored_items) > 1 else 0
+            
+            # Confidence Threshold Logic
+            THRESHOLD = 0.6
+            MARGIN = 0.15  # Must beat the runner-up by this margin, or be above threshold
+            
+            # If the user's query didn't strongly match *anything* specific, or it's a tie,
+            # we check if query is just generic like "play it" (which yields low scores for all).
+            # If it's a generic query, we default to the first item (items[0]).
+            # If it's specific but ambiguously tied, we abort and let LLM ask for clarification.
+            q_words = set(target_name.split()) - {"play", "listen", "to", "the", "it", "one", "song", "track", "queue", "artist", "album", "playlist", "genre", "some", "something", "any"}
+            is_generic_query = len(q_words) == 0
+            
+            if is_generic_query:
+                # "Play it" -> default to the first one in the list
+                best_items = [items[0]]
+                logger.info("Query is generic ('play it'), falling back to default first item: %s", best_items[0]["name"])
+            elif best_score >= THRESHOLD or (best_score - second_best_score) >= MARGIN:
+                # Clear winner
+                best_items = [best_item]
+                logger.info("Clear winner found: %s (score: %.2f)", best_items[0]["name"], best_score)
+            else:
+                # Ambiguous query (e.g. "play hotel california" when all 5 results are hotel california)
+                logger.info("Ambiguous query. Top score %.2f vs %.2f. Aborting fast path to ask user.", best_score, second_best_score)
+                return None  # Let the Orchestrator/LLM deal with it
+
+        # --- Build tool calls for the selected item(s) ---
         tool_results = []
-        for i, item in enumerate(items):
+        for i, item in enumerate(best_items):
             if is_play and i == 0:
                 tool = ToolCall(name="start_playback", arguments={"uri": item["uri"]}, reason=f"Play {item['name']}")
             else:
@@ -301,7 +387,7 @@ class SpotifyAgent:
             )
             interpretation = f"{len(failed)} of {len(tool_results)} tool(s) failed — {error_summary}"
         else:
-            interpretation = f"Played {len(tool_results)} item(s) directly from context."
+            interpretation = f"Played {len(tool_results)} item(s) directly from context: {', '.join(item['name'] for item in best_items)}."
 
         return QueryResult(
             success=success,
@@ -393,7 +479,7 @@ class SpotifyAgent:
         """Handle search_spotify tool."""
         query = arguments.get("query")
         search_type = arguments.get("type", "track")
-        limit = arguments.get("limit", 10)
+        limit = arguments.get("limit", 5)
 
         results = sp.search(q=query, type=search_type, limit=limit)
 
@@ -407,6 +493,10 @@ class SpotifyAgent:
                 artists = ", ".join([a["name"] for a in track["artists"]])
                 output += f"{i}. {track['name']} by {artists}\n"
                 output += f"   URI: {track['uri']}\n"
+                for a in track["artists"]:
+                    output += f"   Artist URI: {a['uri']} ({a['name']})\n"
+                if "album" in track and "uri" in track["album"]:
+                    output += f"   Album URI: {track['album']['uri']} ({track['album']['name']})\n"
             return output
 
         elif search_type == "artist":

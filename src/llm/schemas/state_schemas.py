@@ -1,120 +1,36 @@
-from typing import TypedDict, List, Literal, Optional, Any
+"""State schemas for the LangGraph hierarchical agents."""
 
-RouteType = Literal["graph_rag", "spotify"]
+from typing import Annotated, TypedDict, List, Dict, Any, Sequence
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+import operator
 
+def merge_dict(a: dict, b: dict) -> dict:
+    """Merges two dictionaries, commonly used to aggregate tool results into a final context block."""
+    result = a.copy()
+    result.update(b)
+    return result
 
-
-class ExecutionStep(TypedDict):
-    """A single step in the execution plan."""
-    step: int
-    query: str
-    route: RouteType
-    depends_on: Optional[int]
-    context_needed: Optional[str]
-
-
-class RouterState(TypedDict):
-    """Main state for the router agent."""
-    # Input
-    original_query: str
-
-    # Processing
-    cleaned_query: str
-    is_multi_part: bool
-
-    # Execution
-    execution_plan: List[ExecutionStep]
-    current_step: int
-    intermediate_results: dict[int, Any]
-
-    # Output
-    final_response: Optional[str]
+class GlobalState(TypedDict):
+    """The main state object passed through the Manager Graph.
+    
+    Attributes:
+        messages: The conversation history, including Human, AI, and Tool messages.
+                  Uses `add_messages` to automatically append new messages rather than overwrite.
+        step_results: A collected dictionary of raw, structured data returned by the worker agents.
+                      This replicates the old system's context gathering, allowing the wrapper
+                      to extract it and save it to Neo4j.
+    """
+    messages: Annotated[list[BaseMessage], add_messages]
+    step_results: Annotated[Dict[str, Any], merge_dict]
 
 
-class QueryResult(TypedDict):
-    """Result from a Graph RAG or Spotify agent query."""
-    success: bool
-    data: List[Any]
-    interpretation: str
-    cypher_used: Optional[str]  # Only for Graph RAG
-
-
-class GraphRAGState(TypedDict):
-    """State for the Graph RAG agent."""
-    # Input
-    query: str
-    context: Optional[str]  # Context from previous steps
-
-    # Cypher generation
-    cypher_query: str
-    query_explanation: str
-    return_type: str  # "single_value", "list", "table", "aggregation"
-
-    # Execution
-    raw_results: List[Any]
-    interpreted_response: str
-
-    # Error handling
-    error: Optional[str]
-    retry_count: int
-
-    # Output
-    result: Optional[QueryResult]
-
-
-class ToolCall(TypedDict):
-    """A single tool call with arguments."""
-    name: str
-    arguments: dict
-    reason: Optional[str]
-
-
-class SpotifyAgentState(TypedDict):
-    """State for the Spotify agent."""
-    # Input
-    query: str
-    context: Optional[str]  # Context from previous steps (e.g., track info from Graph RAG)
-
-    # Tool selection
-    selected_tools: List[ToolCall]
-    current_tool_index: int
-    requires_search_first: bool
-
-    # Execution
-    tool_results: List[dict]  # Results from each tool execution
-    interpreted_response: str
-
-    # Error handling
-    error: Optional[str]
-    retry_count: int
-
-    # Output
-    result: Optional[QueryResult]
-
-
-class StepResult(TypedDict):
-    """Result from a single execution step."""
-    step: int
-    query: str
-    route: RouteType
-    result: QueryResult
-    context_used: Optional[str]
-
-
-SynthesisType = Literal["single", "multi", "chained", "error"]
-
-
-class SynthesisState(TypedDict):
-    """State for the Response Synthesis agent."""
-    # Input
-    original_query: str
-    step_results: List[StepResult]
-
-    # Processing
-    synthesis_type: SynthesisType  # Determines which prompt to use
-    has_errors: bool
-
-    # Output
-    final_response: str
-
-
+class WorkerState(TypedDict):
+    """The state object passed to individual Worker Sub-Graphs (Spotify or Graph RAG).
+    
+    Attributes:
+        messages: The isolated thought process and tool calls for this specific task.
+                  We intentionally do not pass the entire GlobalState history down 
+                  to prevent confusing the worker with unrelated context.
+    """
+    messages: Annotated[list[BaseMessage], add_messages]

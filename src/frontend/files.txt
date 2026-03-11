@@ -1,0 +1,2 @@
+src/frontend/tailwind.config.js
+src/frontend/src/assets/react.svg

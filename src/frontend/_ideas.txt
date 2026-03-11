@@ -1,0 +1,13 @@
+# Ideas & Future Enhancements
+
+## "Previous Chat" Overwrite Implementation Strategy
+When a user exits a live chat (either by closing the tab or starting a new one), that chat should instantly become their "Previous Chat".
+To achieve this securely across different exit scenarios:
+
+1. **Tab Close / Page Refresh:**
+   - Use the **Backend `WebSocketDisconnect` event** in FastAPI (`websocket.py`).
+   - When the websocket drops, immediately trigger the database save logic to set that `session_id` as the most recent chat for the user in Neo4j.
+2. **Clicking "New Chat" (In-App Navigation):**
+   - React Router doesn't trigger a page reload, so the WebSocket doesn't disconnect.
+   - Use a **React `useEffect` cleanup function** inside `ChatInterface.jsx` tied to the `chatId` dependency. 
+   - When the component unmounts/swaps IDs, fire an API call (or a final WebSocket message) telling the backend to finalize and save the outgoing session.

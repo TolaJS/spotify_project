@@ -1,623 +1,251 @@
-"""Spotify Agent - Handles live Spotify operations via tool calls."""
+"""Spotify Worker Agent for LangGraph."""
 
 import json
-import logging
-import re
-from typing import Optional
-from langchain_core.messages import HumanMessage
+from langchain_core.tools import tool
+from langchain.agents import create_agent
 
-from ..schemas.state_schemas import QueryResult, ToolCall
-from ..prompts.spotify_prompts import (
-    TOOL_DESCRIPTIONS,
-    TOOL_SELECTION_PROMPT,
-    MULTI_TOOL_PLANNING_PROMPT,
-)
+# Import prompts and configs
+from ..prompts.spotify_prompts import SPOTIFY_WORKER_SYSTEM_PROMPT
 from ..utils.config import get_gemini_llm
 
-logger = logging.getLogger(__name__)
+# We will dynamically import the spotify client to avoid circular/init issues
+def get_client():
+    from auth.oauth_handler import get_spotify_client
+    return get_spotify_client()
 
-
-def get_response_text(response) -> str:
-    """Extract text content from LLM response, handling different formats."""
-    content = response.content
-    if isinstance(content, list):
-        return "".join(
-            part.get("text", str(part)) if isinstance(part, dict) else str(part)
-            for part in content
-        )
-    return str(content)
-
-
-def parse_json_response(content: str) -> dict:
-    """Parse JSON from LLM response, handling markdown code blocks."""
-    content = content.strip()
-    if content.startswith("```"):
-        content = re.sub(r"^```(?:json)?\s*\n?", "", content)
-        content = re.sub(r"\n?```\s*$", "", content)
-    return json.loads(content)
-
-
-class SpotifyAgent:
-    """Agent for live Spotify operations.
-
-    Flow:
-    1. Select tool(s) from natural language query
-    2. Execute tools sequentially
-    3. After searches, plan follow-up actions if needed
-    4. Return raw results (Synthesis agent handles interpretation)
+@tool
+def search_spotify(query: str, search_type: str = "track", limit: int = 5) -> str:
+    """Search for content on Spotify.
+    
+    Args:
+        query: The search term (e.g., track name, artist name)
+        search_type: "track", "artist", or "album"
+        limit: Number of results to return
     """
-
-    def __init__(self, llm=None, spotify_client=None):
-        self.llm = llm or get_gemini_llm()
-        self._spotify_client = spotify_client
-
-    def _get_spotify_client(self):
-        """Lazy initialization of Spotify client."""
-        if self._spotify_client is None:
-            import sys
-            import os
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-            from auth.oauth_handler import get_spotify_client
-            self._spotify_client = get_spotify_client()
-        return self._spotify_client
-
-    # -- LLM calls --
-
-    def _select_tools(self, query: str, context: str = None) -> tuple[list[ToolCall], str]:
-        """Select tools based on the natural language query.
-
-        Returns:
-            Tuple of (selected_tools, error_message)
-        """
-        prompt = TOOL_SELECTION_PROMPT.format(
-            tool_descriptions=TOOL_DESCRIPTIONS,
-            query=query,
-            context=context or "None",
-        )
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-        response_text = get_response_text(response)
-
-        try:
-            result = parse_json_response(response_text)
-            tools = [
-                ToolCall(
-                    name=t.get("name", ""),
-                    arguments=t.get("arguments", {}),
-                    reason=t.get("reason"),
-                )
-                for t in result.get("tools", [])
-            ]
-            return tools, None
-        except json.JSONDecodeError:
-            return [], f"Failed to parse tool selection: {response_text[:200]}"
-
-    def _plan_next_tool(self, query: str, context: str, tool_results: list) -> tuple[ToolCall | None, str]:
-        """Ask the LLM to plan a follow-up tool based on previous results.
-
-        Returns:
-            Tuple of (next_tool_or_None, error_message)
-        """
-        prompt = MULTI_TOOL_PLANNING_PROMPT.format(
-            query=query,
-            context=context or "None",
-            previous_results=json.dumps(tool_results, indent=2),
-            tool_descriptions=TOOL_DESCRIPTIONS,
-        )
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-        response_text = get_response_text(response)
-
-        try:
-            result = parse_json_response(response_text)
-            tool_info = result.get("tool", {})
-
-            if result.get("is_final") or tool_info.get("name") == "none":
-                return None, None
-
-            return ToolCall(
-                name=tool_info.get("name", ""),
-                arguments=tool_info.get("arguments", {}),
-                reason=result.get("explanation"),
-            ), None
-        except json.JSONDecodeError:
-            return None, f"Failed to plan next tool: {response_text[:200]}"
-
-    # -- Tool execution --
-
-    def _execute_tool(self, tool: ToolCall) -> dict:
-        """Execute a single tool and return a result dict."""
-        try:
-            result = self._call_tool(tool["name"], tool["arguments"])
-            return {
-                "tool": tool["name"],
-                "arguments": tool["arguments"],
-                "result": result,
-                "success": True,
-            }
-        except Exception as e:
-            return {
-                "tool": tool["name"],
-                "arguments": tool["arguments"],
-                "result": str(e),
-                "success": False,
-            }
-
-    def _call_tool(self, tool_name: str, arguments: dict) -> str:
-        """Execute a tool and return its result."""
-        sp = self._get_spotify_client()
-
-        handlers = {
-            "search_spotify": self._handle_search,
-            "create_playlist": self._handle_create_playlist,
-            "add_to_playlist": self._handle_add_to_playlist,
-            "get_playlists": self._handle_get_playlists,
-            "recently_played": self._handle_recently_played,
-            "current_playing": self._handle_current_playing,
-            "add_to_queue": self._handle_add_to_queue,
-            "start_playback": self._handle_start_playback,
-        }
-
-        handler = handlers.get(tool_name)
-        if not handler:
-            raise ValueError(f"Unknown tool: {tool_name}")
-        return handler(sp, arguments)
-
-    # -- Deterministic follow-up from search results --
-
-    def _extract_uris_from_results(self, tool_results: list) -> list[str]:
-        """Extract Spotify URIs (track, artist, album) from search result strings."""
-        uris = []
-        for r in tool_results:
-            if r.get("tool") == "search_spotify" and r.get("success"):
-                found = re.findall(r"spotify:(?:track|artist|album):[a-zA-Z0-9]+", r.get("result", ""))
-                if found:
-                    uris.append(found[0])
-        return uris
-
-    def _try_deterministic_followup(self, query: str, context: str, tool_results: list) -> list[ToolCall]:
-        """Build follow-up tool calls from search results without an LLM call.
-
-        If the query implies an action (play/queue/playlist) and search results
-        contain URIs, build the tool calls directly.
-        """
-        query_lower = query.lower()
-        uris = self._extract_uris_from_results(tool_results)
-
-        if not uris:
-            return []
-
-        # Play: start_playback for the first URI, add_to_queue for the rest
-        # Works for track, artist, and album URIs
-        if any(word in query_lower for word in ["play", "listen", "put on", "start"]):
-            tools = [ToolCall(name="start_playback", arguments={"uri": uris[0]}, reason=f"Play {uris[0]}")]
-            for uri in uris[1:]:
-                tools.append(ToolCall(name="add_to_queue", arguments={"track_uri": uri}, reason=f"Queue {uri}"))
-            return tools
-
-        if "queue" in query_lower:
-            return [
-                ToolCall(name="add_to_queue", arguments={"track_uri": uri}, reason=f"Queue track {uri}")
-                for uri in uris
-            ]
-
-        if "playlist" in query_lower:
-            playlist_id_match = re.search(
-                r"(?:playlist[_ ]?(?:id|ID)[:\s]*)?([a-zA-Z0-9]{22})", context or ""
-            )
-            if playlist_id_match:
-                return [
-                    ToolCall(
-                        name="add_to_playlist",
-                        arguments={"playlist_id": playlist_id_match.group(1), "track_uris": uris},
-                        reason="Add searched tracks to playlist",
-                    )
-                ]
-
-        return []
-
-    # -- Main query method --
-
-    def _extract_spotify_ids_from_context(self, context: str) -> list[dict]:
-        """Extract spotify_ids from Graph RAG context data.
-
-        Parses the JSON data embedded in the context string and pulls out
-        spotify_id (for tracks/albums) or id (for artists) along with names.
-
-        Returns:
-            List of dicts with 'uri' and 'name' for each item found.
-        """
-        if not context:
-            return []
-
-        # The context string contains JSON after "Data (N total items):"
-        json_match = re.search(r"Data \(\d+ total items?\):\s*(\[.+)", context, re.DOTALL)
-        if not json_match:
-            return []
-
-        try:
-            data = json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            return []
-
-        items = []
-        for record in data:
-            # If a full URI is already provided (e.g. from a Search result), respect it directly
-            full_uri = record.get("uri")
-            if full_uri:
-                items.append({"uri": full_uri, "name": record.get("name", "Unknown")})
-                continue
-
-            # Albums (al.spotify_id)
-            al_spotify_id = record.get("al.spotify_id")
-            if al_spotify_id:
-                name = record.get("name") or record.get("al.name")
-                items.append({"uri": f"spotify:album:{al_spotify_id}", "name": name or al_spotify_id})
-                continue
-
-            # Tracks (t.spotify_id or spotify_id)
-            t_spotify_id = record.get("t.spotify_id") or record.get("spotify_id")
-            if t_spotify_id:
-                name = record.get("name") or record.get("t.name") or record.get("track")
-                items.append({"uri": f"spotify:track:{t_spotify_id}", "name": name or t_spotify_id})
-                continue
-
-            # Artists — schema stores artist Spotify ID as `id`, `a.id`, or aliased as `artist_id`
-            artist_id = record.get("artist_id") or record.get("a.id") or record.get("id")
-            if artist_id:
-                name = record.get("artist_name") or record.get("name") or record.get("a.name")
-                items.append({"uri": f"spotify:artist:{artist_id}", "name": name or artist_id})
-
-        return items
-
-    def _try_direct_playback_from_context(self, query: str, context: str) -> QueryResult | None:
-        """Fast path: if context already has spotify_ids and the query implies
-        playback, skip search entirely and play/queue directly.
-        
-        Uses semantic fuzzy-matching to select the best track if multiple exist.
-
-        Returns:
-            QueryResult if handled, None if this fast path doesn't apply.
-        """
-        query_lower = query.lower()
-
-        # Only trigger for playback-related queries using explicit action intents from the Rewriter
-        is_play = query_lower.startswith("play")
-        is_queue = query_lower.startswith("queue")
-        if not is_play and not is_queue:
-            return None
-
-        items = self._extract_spotify_ids_from_context(context)
-        logger.info("direct_playback_from_context: extracted %d item(s): %s", len(items), items)
-        if not items:
-            logger.info("direct_playback_from_context: no items found, falling back to normal flow")
-            return None
-
-        # --- Semantic Matching to find the best item ---
-        # If there's only 1 item, just use it
-        if len(items) == 1:
-            best_items = items
-        else:
-            import difflib
-            
-            # Extract the actual entity name we are looking for (the rewriter puts it in quotes)
-            import re
-            match = re.search(r'"([^"]*)"', query)
-            target_name = match.group(1).lower() if match else query_lower
-            
-            target_type = None
-            if "artist" in query_lower: target_type = "artist"
-            elif "album" in query_lower: target_type = "album"
-            elif "playlist" in query_lower: target_type = "playlist"
-            elif "track" in query_lower or "song" in query_lower: target_type = "track"
-            
-            # Helper to score an item against the target name
-            def get_match_score(target, item):
-                item_name = item["name"]
-                item_uri = item["uri"]
-                
-                # 1. SequenceMatcher score (good for exact substring matches, but fails if words are reordered)
-                seq_score = difflib.SequenceMatcher(None, target, item_name.lower()).ratio()
-                
-                # 2. Word overlap score (good for catching "live" or "acoustic" modifiers)
-                stop_words = {"play", "listen", "to", "the", "a", "an", "of", "version", "on", "it", "one", "queue", "song", "track", "artist", "album", "playlist"}
-                q_words = set(target.split()) - stop_words
-                i_words = set(item_name.lower().split()) - stop_words
-                
-                if not q_words:
-                    word_score = 0
-                else:
-                    word_score = len(q_words.intersection(i_words)) / len(q_words)
-                    
-                score = (seq_score * 0.3) + (word_score * 0.7)
-                
-                # 3. Type match bonus
-                if target_type:
-                    if f":{target_type}:" in item_uri:
-                        score += 0.2  # Bonus for correct entity type
-                    else:
-                        score -= 0.1  # Slight penalty for wrong entity type
-                        
-                return score
-                
-            scored_items = [(item, get_match_score(target_name, item)) for item in items]
-            scored_items.sort(key=lambda x: x[1], reverse=True)
-            
-            logger.info("Semantic match scores: %s", scored_items)
-            
-            best_item, best_score = scored_items[0]
-            second_best_score = scored_items[1][1] if len(scored_items) > 1 else 0
-            
-            # Confidence Threshold Logic
-            THRESHOLD = 0.6
-            MARGIN = 0.15  # Must beat the runner-up by this margin, or be above threshold
-            
-            # If the user's query didn't strongly match *anything* specific, or it's a tie,
-            # we check if query is just generic like "play it" (which yields low scores for all).
-            # If it's a generic query, we default to the first item (items[0]).
-            # If it's specific but ambiguously tied, we abort and let LLM ask for clarification.
-            q_words = set(target_name.split()) - {"play", "listen", "to", "the", "it", "one", "song", "track", "queue", "artist", "album", "playlist", "genre", "some", "something", "any"}
-            is_generic_query = len(q_words) == 0
-            
-            if is_generic_query:
-                # "Play it" -> default to the first one in the list
-                best_items = [items[0]]
-                logger.info("Query is generic ('play it'), falling back to default first item: %s", best_items[0]["name"])
-            elif best_score >= THRESHOLD or (best_score - second_best_score) >= MARGIN:
-                # Clear winner
-                best_items = [best_item]
-                logger.info("Clear winner found: %s (score: %.2f)", best_items[0]["name"], best_score)
-            else:
-                # Ambiguous query (e.g. "play hotel california" when all 5 results are hotel california)
-                logger.info("Ambiguous query. Top score %.2f vs %.2f. Aborting fast path to ask user.", best_score, second_best_score)
-                return None  # Let the Orchestrator/LLM deal with it
-
-        # --- Build tool calls for the selected item(s) ---
-        tool_results = []
-        for i, item in enumerate(best_items):
-            if is_play and i == 0:
-                tool = ToolCall(name="start_playback", arguments={"uri": item["uri"]}, reason=f"Play {item['name']}")
-            else:
-                tool = ToolCall(name="add_to_queue", arguments={"track_uri": item["uri"]}, reason=f"Queue {item['name']}")
-            tool_results.append(self._execute_tool(tool))
-
-        success = all(r.get("success", False) for r in tool_results)
-        if not success:
-            failed = [r for r in tool_results if not r.get("success")]
-            error_summary = "; ".join(
-                f"{r['tool']} failed: {r['result']}" for r in failed
-            )
-            interpretation = f"{len(failed)} of {len(tool_results)} tool(s) failed — {error_summary}"
-        else:
-            interpretation = f"Played {len(tool_results)} item(s) directly from context: {', '.join(item['name'] for item in best_items)}."
-
-        return QueryResult(
-            success=success,
-            data=tool_results,
-            interpretation=interpretation,
-            cypher_used=None,
-        )
-
-    def query(self, query: str, context: str = None) -> QueryResult:
-        """Execute a natural language query for Spotify operations.
-
-        Args:
-            query: Natural language request
-            context: Optional context from previous steps
-
-        Returns:
-            QueryResult with data and interpretation
-        """
-        # Fast path: if Graph RAG already gave us spotify_ids and the query
-        # is about playing/queueing, skip search and LLM calls entirely
-        logger.info("SpotifyAgent.query: context present=%s | context_preview=%s", context is not None, (context or "")[:120])
-        direct_result = self._try_direct_playback_from_context(query, context)
-        if direct_result is not None:
-            return direct_result
-
-        # Step 1: Select tools
-        tools, error = self._select_tools(query, context)
-
-        if error or not tools:
-            return QueryResult(
-                success=False,
-                data=[],
-                interpretation=error or "No tools selected",
-                cypher_used=None,
-            )
-
-        # Step 2: Execute selected tools
-        tool_results = []
-        for tool in tools:
-            tool_results.append(self._execute_tool(tool))
-
-        # Step 3: If only searches were executed, plan follow-up actions
-        only_searches = all(r.get("tool") == "search_spotify" for r in tool_results)
-
-        if only_searches:
-            # Try deterministic follow-up first (extract URIs + match query intent)
-            followup_tools = self._try_deterministic_followup(query, context, tool_results)
-
-            # Fall back to LLM planning if deterministic didn't produce anything.
-            # Loop until the LLM says is_final — each iteration can return one
-            # tool (e.g., start_playback for the first track, then add_to_queue
-            # for each remaining track).
-            if not followup_tools:
-                max_followups = 10  # safety cap to avoid infinite loops
-                for _ in range(max_followups):
-                    next_tool, _ = self._plan_next_tool(query, context, tool_results)
-                    if next_tool is None:
-                        break
-                    result = self._execute_tool(next_tool)
-                    tool_results.append(result)
-            else:
-                # Execute deterministic follow-up tools
-                for tool in followup_tools:
-                    tool_results.append(self._execute_tool(tool))
-
-        # Step 4: Return results
-        success = all(r.get("success", False) for r in tool_results)
-        if not tool_results:
-            interpretation = "No tools were executed."
-        elif not success:
-            failed = [r for r in tool_results if not r.get("success")]
-            error_summary = "; ".join(
-                f"{r['tool']} failed: {r['result']}" for r in failed
-            )
-            interpretation = f"{len(failed)} of {len(tool_results)} tool(s) failed — {error_summary}"
-        else:
-            interpretation = f"Executed {len(tool_results)} tool(s) successfully."
-
-        return QueryResult(
-            success=success,
-            data=tool_results,
-            interpretation=interpretation,
-            cypher_used=None,
-        )
-
-    # -- Tool handlers --
-
-    def _handle_search(self, sp, arguments: dict) -> str:
-        """Handle search_spotify tool."""
-        query = arguments.get("query")
-        search_type = arguments.get("type", "track")
-        limit = arguments.get("limit", 5)
-
+    sp = get_client()
+    try:
         results = sp.search(q=query, type=search_type, limit=limit)
-
+        formatted = []
+        
         if search_type == "track":
-            items = results["tracks"]["items"]
-            if not items:
-                return f"No tracks found for '{query}'"
-
-            output = f"Found {len(items)} track(s) for '{query}':\n"
-            for i, track in enumerate(items, 1):
-                artists = ", ".join([a["name"] for a in track["artists"]])
-                output += f"{i}. {track['name']} by {artists}\n"
-                output += f"   URI: {track['uri']}\n"
-                for a in track["artists"]:
-                    output += f"   Artist URI: {a['uri']} ({a['name']})\n"
-                if "album" in track and "uri" in track["album"]:
-                    output += f"   Album URI: {track['album']['uri']} ({track['album']['name']})\n"
-            return output
-
+            for item in results.get("tracks", {}).get("items", []):
+                artists = ", ".join([a["name"] for a in item["artists"]])
+                formatted.append({
+                    "name": item["name"],
+                    "artists": artists,
+                    "album": item.get("album", {}).get("name"),
+                    "album_type": item.get("album", {}).get("album_type"),
+                    "release_date": item.get("album", {}).get("release_date"),
+                    "uri": item["uri"]
+                })
         elif search_type == "artist":
-            items = results["artists"]["items"]
-            if not items:
-                return f"No artists found for '{query}'"
-
-            output = f"Found {len(items)} artist(s) for '{query}':\n"
-            for i, artist in enumerate(items, 1):
-                output += f"{i}. {artist['name']}\n"
-                output += f"   URI: {artist['uri']}\n"
-            return output
-
+            for item in results.get("artists", {}).get("items", []):
+                formatted.append({
+                    "name": item["name"],
+                    "genres": item.get("genres", []),
+                    "uri": item["uri"]
+                })
         elif search_type == "album":
-            items = results["albums"]["items"]
+            for item in results.get("albums", {}).get("items", []):
+                artists = ", ".join([a["name"] for a in item["artists"]])
+                # Fetch full track listing for this album
+                try:
+                    album_tracks = sp.album_tracks(item["id"], limit=50)
+                    track_names = [t["name"] for t in album_tracks.get("items", [])]
+                except Exception:
+                    track_names = []
+                formatted.append({
+                    "name": item["name"],
+                    "artists": artists,
+                    "release_date": item.get("release_date"),
+                    "total_tracks": item.get("total_tracks"),
+                    "tracks": track_names,
+                    "uri": item["uri"]
+                })
+                
+        return json.dumps(formatted, indent=2)
+    except Exception as e:
+        return f"Error searching Spotify: {str(e)}"
+
+@tool
+def add_to_queue(
+    track: str = None,
+    artist: str = None,
+) -> str:
+    """Search for a track and add it to the user's playback queue.
+
+    Args:
+        track: Track name to search for.
+        artist: Artist name to narrow the search.
+    """
+    sp = get_client()
+    try:
+        query_parts = []
+        if track:
+            query_parts.append(f'track:"{track}"')
+        if artist:
+            query_parts.append(f'artist:"{artist}"')
+        query = " ".join(query_parts)
+
+        if not query:
+            return "Error: provide at least a track name to queue."
+
+        results = sp.search(q=query, type="track", limit=1)
+        items = results.get("tracks", {}).get("items", [])
+
+        if not items:
+            return f"No track found for query: '{query}'."
+
+        uri = items[0]["uri"]
+        label = items[0]["name"]
+
+        sp.add_to_queue(uri)
+        return f"Successfully added '{label}' to queue."
+    except Exception as e:
+        return f"Error adding to queue. Ensure Spotify is open and active on a device. Error: {str(e)}"
+
+@tool
+def start_playback(
+    search_type: str = None,
+    track: str = None,
+    artist: str = None,
+    album: str = None,
+    uri: str = None,
+    offset: int = None,
+) -> str:
+    """Start playing a track, album, or artist on the user's active device.
+    Searches for the content first unless a URI is directly provided.
+
+    Args:
+        search_type: What to search for — "track", "album", or "artist". Required unless uri is provided.
+        track: Track name to include in the search query.
+        artist: Artist name to include in the search query.
+        album: Album name to include in the search query.
+        uri: Optional. A known Spotify URI to play directly, skipping the search.
+        offset: Optional. Zero-based track position to start playback from within a context (album/playlist). E.g. 2 starts from the 3rd track.
+    """
+    sp = get_client()
+    try:
+        if not uri:
+            if not search_type:
+                return "Error: provide either a uri or a search_type to start playback."
+
+            # Build Spotify field-filtered query
+            query_parts = []
+            if track:
+                query_parts.append(f'track:"{track}"')
+            if artist:
+                query_parts.append(f'artist:"{artist}"')
+            if album:
+                query_parts.append(f'album:"{album}"')
+            query = " ".join(query_parts)
+
+            if not query:
+                return "Error: provide at least one of track, artist, or album to search."
+
+            results = sp.search(q=query, type=search_type, limit=1)
+
+            if search_type == "track":
+                items = results.get("tracks", {}).get("items", [])
+            elif search_type == "artist":
+                items = results.get("artists", {}).get("items", [])
+            elif search_type == "album":
+                items = results.get("albums", {}).get("items", [])
+            else:
+                return f"Error: unsupported search_type '{search_type}'. Use 'track', 'album', or 'artist'."
+
             if not items:
-                return f"No albums found for '{query}'"
+                return f"No {search_type} found for query: '{query}'."
 
-            output = f"Found {len(items)} album(s) for '{query}':\n"
-            for i, album in enumerate(items, 1):
-                artists = ", ".join([a["name"] for a in album["artists"]])
-                output += f"{i}. {album['name']} by {artists}\n"
-                output += f"   URI: {album['uri']}\n"
-            return output
+            uri = items[0]["uri"]
+            label = items[0]["name"]
+        else:
+            label = uri
 
-        return "Unknown search type"
+        offset_param = {"position": offset} if offset is not None else None
 
-    def _handle_create_playlist(self, sp, arguments: dict) -> str:
-        """Handle create_playlist tool."""
-        name = arguments.get("name")
-        description = arguments.get("description", "")
-        public = arguments.get("public", True)
-
-        playlist = sp.user_playlist_create(
-            sp.me()["id"], name, public=public, description=description
-        )
-        return f"Created playlist '{playlist['name']}' (ID: {playlist['id']})\nURI: {playlist['uri']}"
-
-    def _handle_add_to_playlist(self, sp, arguments: dict) -> str:
-        """Handle add_to_playlist tool."""
-        playlist_id = arguments.get("playlist_id")
-        track_uris = arguments.get("track_uris", [])
-
-        sp.playlist_add_items(playlist_id, track_uris)
-        return f"Added {len(track_uris)} track(s) to playlist {playlist_id}"
-
-    def _handle_get_playlists(self, sp, arguments: dict) -> str:
-        """Handle get_playlists tool."""
-        limit = arguments.get("limit", 20)
-
-        playlists = sp.current_user_playlists(limit=limit)
-
-        if not playlists["items"]:
-            return "No playlists found"
-
-        output = f"Found {len(playlists['items'])} playlist(s):\n"
-        for i, playlist in enumerate(playlists["items"], 1):
-            output += f"{i}. {playlist['name']}\n"
-            output += f"   Tracks: {playlist['tracks']['total']}\n"
-            output += f"   ID: {playlist['id']}\n"
-        return output
-
-    def _handle_recently_played(self, sp, arguments: dict) -> str:
-        """Handle recently_played tool."""
-        limit = arguments.get("limit", 50)
-
-        results = sp.current_user_recently_played(limit=limit)
-
-        if not results["items"]:
-            return "No recently played tracks found"
-
-        output = f"Recently played ({len(results['items'])} tracks):\n"
-        for i, item in enumerate(results["items"], 1):
-            track = item["track"]
-            artists = ", ".join([a["name"] for a in track["artists"]])
-            output += f"{i}. {track['name']} by {artists}\n"
-            output += f"   URI: {track['uri']}\n"
-        return output
-
-    def _handle_current_playing(self, sp, arguments: dict) -> str:
-        """Handle current_playing tool."""
-        currently_playing = sp.current_playback()
-
-        if not currently_playing or not currently_playing.get("item"):
-            return "No track currently playing"
-
-        track = currently_playing["item"]
-        artists = ", ".join([a["name"] for a in track["artists"]])
-        is_playing = currently_playing["is_playing"]
-
-        progress_ms = currently_playing["progress_ms"]
-        duration_ms = track["duration_ms"]
-        progress_min = progress_ms // 60000
-        progress_sec = (progress_ms % 60000) // 1000
-        duration_min = duration_ms // 60000
-        duration_sec = (duration_ms % 60000) // 1000
-
-        return (
-            f"Currently {'playing' if is_playing else 'paused'}:\n"
-            f"Track: {track['name']}\n"
-            f"Artist(s): {artists}\n"
-            f"Album: {track['album']['name']}\n"
-            f"Progress: {progress_min}:{progress_sec:02d} / {duration_min}:{duration_sec:02d}\n"
-            f"URI: {track['uri']}"
-        )
-
-    def _handle_add_to_queue(self, sp, arguments: dict) -> str:
-        """Handle add_to_queue tool."""
-        track_uri = arguments.get("track_uri")
-
-        sp.add_to_queue(track_uri)
-        return f"Added track to queue: {track_uri}"
-
-    def _handle_start_playback(self, sp, arguments: dict) -> str:
-        """Handle start_playback tool. Plays a track, album, artist, or playlist by URI."""
-        uri = arguments.get("uri")
-
-        # Tracks must be passed as a list via `uris`, everything else uses `context_uri`
-        if uri.startswith("spotify:track:"):
+        if "track" in uri:
             sp.start_playback(uris=[uri])
         else:
-            sp.start_playback(context_uri=uri)
+            sp.start_playback(context_uri=uri, offset=offset_param)
 
-        return f"Started playback: {uri}"
+        return f"Successfully started playback for '{label}'."
+    except Exception as e:
+        return f"Error starting playback. Ensure Spotify is open and active on a device. Error: {str(e)}"
+
+@tool
+def currently_playing() -> str:
+    """Check what is currently playing on the user's Spotify account."""
+    sp = get_client()
+    try:
+        current = sp.current_playback()
+        if not current or not current.get("item"):
+            return "Nothing is currently playing on Spotify."
+            
+        track = current["item"]
+        artists = ", ".join([a["name"] for a in track["artists"]])
+        return json.dumps({
+            "name": track["name"],
+            "artists": artists,
+            "is_playing": current["is_playing"],
+            "device": current.get("device", {}).get("name", "Unknown")
+        })
+    except Exception as e:
+        return f"Error checking playback: {str(e)}"
+
+@tool
+def create_playlist(name: str, description: str = "", public: bool = True) -> str:
+    """Create a new playlist for the user.
+    
+    Args:
+        name: Name of the playlist
+        description: Description
+        public: Whether it is public
+    """
+    sp = get_client()
+    try:
+        user_id = sp.me()["id"]
+        playlist = sp.user_playlist_create(
+            user=user_id, name=name, public=public, description=description
+        )
+        return json.dumps({"status": "success", "id": playlist["id"], "uri": playlist["uri"]})
+    except Exception as e:
+        return f"Error creating playlist: {str(e)}"
+
+@tool
+def add_to_playlist(playlist_id: str, track_uris: list[str]) -> str:
+    """Add a list of track URIs to a specific playlist.
+    
+    Args:
+        playlist_id: The ID of the playlist
+        track_uris: A list of Spotify track URIs
+    """
+    sp = get_client()
+    try:
+        sp.playlist_add_items(playlist_id=playlist_id, items=track_uris)
+        return f"Successfully added {len(track_uris)} tracks to playlist."
+    except Exception as e:
+        return f"Error adding to playlist: {str(e)}"
+
+# TODO: Add a tool that can search the user's saved playlists by name and play a specific one.
+#       Should support: listing all playlists, fuzzy name matching, and starting playback for the matched playlist URI.
+
+# Compile the Spotify Worker Graph
+spotify_tools = [
+    search_spotify, 
+    add_to_queue, 
+    start_playback, 
+    currently_playing, 
+    create_playlist, 
+    add_to_playlist
+]
+
+def build_spotify_worker():
+    """Builds and returns the Spotify ReAct agent."""
+    llm = get_gemini_llm(temperature=0)
+    agent = create_agent(
+        llm, 
+        tools=spotify_tools,
+        system_prompt=SPOTIFY_WORKER_SYSTEM_PROMPT
+    )
+    return agent

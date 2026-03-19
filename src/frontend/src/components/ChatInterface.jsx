@@ -11,7 +11,9 @@ const SUGGESTIONS = [
     "Queue some lofi beats"
 ];
 
-function ChatInterface({ onProcessingChange }) {
+const USER_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+function ChatInterface({ onProcessingChange, userId }) {
     const { chatId } = useParams();
     const navigate = useNavigate();
     const location = useLocation();
@@ -80,9 +82,14 @@ function ChatInterface({ onProcessingChange }) {
         };
     }, [chatId]);
 
-    // Auto-scroll to bottom whenever messages update
+    // Auto-scroll to bottom whenever messages update.
+    // Use 'instant' when history first loads (isConnecting just finished) so mobile
+    // doesn't get stuck mid-thread; use 'smooth' for new messages during a live chat.
+    const prevMessageCountRef = useRef(0);
     useEffect(() => {
-        endOfMessagesRef.current?.scrollIntoView({ behavior: 'smooth' });
+        const isInitialLoad = prevMessageCountRef.current === 0 && messages.length > 0;
+        endOfMessagesRef.current?.scrollIntoView({ behavior: isInitialLoad ? 'instant' : 'smooth' });
+        prevMessageCountRef.current = messages.length;
     }, [messages]);
 
     useEffect(() => {
@@ -92,7 +99,8 @@ function ChatInterface({ onProcessingChange }) {
         }
 
         let isMounted = true;
-        const ws = new WebSocket('ws://127.0.0.1:5173/ws/chat');
+        let pingInterval = null;
+        const ws = new WebSocket(import.meta.env.VITE_WS_URL);
         const session = chatId;
 
         ws.onopen = () => {
@@ -100,7 +108,14 @@ function ChatInterface({ onProcessingChange }) {
             setIsConnecting(false);
             setConnectionError(null);
             // Initiate handshake
-            ws.send(JSON.stringify({ session_id: session }));
+            ws.send(JSON.stringify({ session_id: session, user_id: userId }));
+
+            // Keepalive ping every 30s to prevent Cloud Run idle timeout
+            pingInterval = setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'ping' }));
+                }
+            }, 30000);
 
             // If a prompt was passed via navigation state, send it immediately
             if (location.state?.initialPrompt) {
@@ -118,10 +133,11 @@ function ChatInterface({ onProcessingChange }) {
                 setProcessing(true);
                 setMessages(prev => [...prev, { id: Date.now() + Math.random(), text: prompt, sender: 'user' }]);
 
-                ws.send(JSON.stringify({ 
-                    query: prompt, 
+                ws.send(JSON.stringify({
+                    query: prompt,
                     session_id: session,
-                    message_id: newMessageId 
+                    message_id: newMessageId,
+                    timezone: USER_TIMEZONE
                 }));
             }
         };
@@ -227,8 +243,9 @@ function ChatInterface({ onProcessingChange }) {
         return () => {
             isMounted = false;
             setProcessing(false);
+            clearInterval(pingInterval);
 
-            // Tell the backend to save this session to Neo4j before we disconnect/navigate away.
+            // Tell the backend to save this session to Firestore before we disconnect/navigate away.
             // We use save_session_only on the backend so the session stays in memory
             // until the WebSocket disconnect actually evicts it.
             if (session && session !== 'local_dev_user') {
@@ -254,7 +271,7 @@ function ChatInterface({ onProcessingChange }) {
         if (!chatId) {
             const uniqueId = Date.now().toString(36) + Math.random().toString(36).substring(2, 7);
             localStorage.setItem('activeSessionId', uniqueId);
-            navigate(`/chat/${uniqueId}`, { state: { initialPrompt: text } });
+            navigate(`/app/${uniqueId}`, { state: { initialPrompt: text } });
             return;
         }
 
@@ -270,10 +287,11 @@ function ChatInterface({ onProcessingChange }) {
         setProcessing(true);
         setMessages(prev => [...prev, { id: Date.now() + Math.random(), text, sender: 'user' }]);
         
-        socket.send(JSON.stringify({ 
-            query: text, 
+        socket.send(JSON.stringify({
+            query: text,
             session_id: session,
-            message_id: newMessageId 
+            message_id: newMessageId,
+            timezone: USER_TIMEZONE
         }));
     };
 

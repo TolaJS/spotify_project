@@ -199,7 +199,7 @@ def create_playlist(name: str, description: str = "", public: bool = True) -> st
     
     Args:
         name: Name of the playlist
-        description: Description
+        description: The playlist description
         public: Whether it is public
     """
     sp = get_client()
@@ -227,17 +227,162 @@ def add_to_playlist(playlist_id: str, track_uris: list[str]) -> str:
     except Exception as e:
         return f"Error adding to playlist: {str(e)}"
 
-# TODO: Add a tool that can search the user's saved playlists by name and play a specific one.
-#       Should support: listing all playlists, fuzzy name matching, and starting playback for the matched playlist URI.
+@tool
+def get_recently_played(limit: int = 20) -> str:
+    """Fetch the user's most recently played tracks from Spotify (live, last 50 max).
+    Use this for questions about what the user just listened to or played recently
+    (e.g. 'what did I just play?', 'what was the last song?').
+    Do NOT use this for historical analysis over weeks/months — use ask_bigquery_worker for that.
+
+    Args:
+        limit: Number of recent tracks to return (max 50).
+    """
+    sp = get_client()
+    try:
+        limit = max(1, min(limit, 50))
+        response = sp.current_user_recently_played(limit=limit)
+        items = response.get("items", [])
+        if not items:
+            return "No recently played tracks found."
+        formatted = []
+        for item in items:
+            track = item["track"]
+            artists = ", ".join(a["name"] for a in track["artists"])
+            formatted.append({
+                "name": track["name"],
+                "artists": artists,
+                "album": track.get("album", {}).get("name"),
+                "played_at": item["played_at"],
+                "uri": track["uri"],
+            })
+        return json.dumps(formatted, indent=2)
+    except Exception as e:
+        return f"Error fetching recently played: {str(e)}"
+
+
+@tool
+def set_playback_state(state: str) -> str:
+    """Pause or resume the user's current Spotify playback.
+
+    Args:
+        state: "pause" to pause playback, "play" to resume playback.
+    """
+    sp = get_client()
+    try:
+        if state == "pause":
+            sp.pause_playback()
+            return "Playback paused."
+        elif state == "play":
+            sp.start_playback()
+            return "Playback resumed."
+        else:
+            return f"Error: invalid state '{state}'. Use 'pause' or 'play'."
+    except Exception as e:
+        return f"Error updating playback state. Ensure Spotify is open and active on a device. Error: {str(e)}"
+
+
+@tool
+def skip_track(direction: str) -> str:
+    """Skip to the next or previous track in the user's Spotify playback queue.
+
+    Args:
+        direction: "next" to skip forward, "previous" to go back.
+    """
+    sp = get_client()
+    try:
+        if direction == "next":
+            sp.next_track()
+            return "Skipped to next track."
+        elif direction == "previous":
+            sp.previous_track()
+            return "Skipped to previous track."
+        else:
+            return f"Error: invalid direction '{direction}'. Use 'next' or 'previous'."
+    except Exception as e:
+        return f"Error skipping track. Ensure Spotify is open and active on a device. Error: {str(e)}"
+
+
+@tool
+def get_current_playlists(limit: int = 20) -> str:
+    """Fetch the user's saved Spotify playlists with name, id, owner, playlist description,and total track count.
+    Use this to list playlists or find a specific playlist by name before playing it. 
+
+    Args:
+        limit: Number of playlists per page (max 50). 20 are fetched automatically.
+    """
+    sp = get_client()
+    try:
+        limit = max(1, min(limit, 50))
+        response = sp.current_user_playlists(limit=limit)
+        playlists = response.get("items", [])
+        while response.get("next"):
+            response = sp.next(response)
+            playlists.extend(response.get("items", []))
+        if not playlists:
+            return "No playlists found."
+
+        formatted = []
+        for playlist in playlists:
+            formatted.append({
+                "name": playlist["name"],
+                "id": playlist["id"],
+                "uri": playlist["uri"],
+                "owner": playlist.get("owner", {}).get("display_name"),
+                "description": playlist.get("description"),
+                "total_tracks": playlist.get("tracks", {}).get("total"),
+            })
+
+        return json.dumps(formatted, indent=2)
+    except Exception as e:
+        return f"Error fetching playlists: {str(e)}"
+
+
+@tool
+def get_playlist_tracks(playlist_id: str, limit: int = 50) -> str:
+    """Fetch the tracks inside a specific playlist by its ID.
+
+    Args:
+        playlist_id: The Spotify playlist ID (from get_current_playlists).
+        limit: Max number of tracks to return (max 100). Fetches 50 by default
+    """
+    sp = get_client()
+    try:
+        limit = max(1, min(limit, 100))
+        response = sp.playlist_tracks(
+            playlist_id,
+            fields="items(item(name,artists(name)))",
+            limit=limit,
+        )
+        items = response.get("items", [])
+        if not items:
+            return "No tracks found in this playlist."
+
+        tracks = [
+            {
+                "name": item["item"]["name"],
+                "artists": ", ".join(a["name"] for a in item["item"]["artists"]),
+            }
+            for item in items
+            if item.get("item")
+        ]
+        return json.dumps(tracks, indent=2)
+    except Exception as e:
+        return f"Error fetching playlist tracks: {str(e)}"
+
 
 # Compile the Spotify Worker Graph
 spotify_tools = [
-    search_spotify, 
-    add_to_queue, 
-    start_playback, 
-    currently_playing, 
-    create_playlist, 
-    add_to_playlist
+    search_spotify,
+    add_to_queue,
+    start_playback,
+    set_playback_state,
+    skip_track,
+    currently_playing,
+    get_recently_played,
+    create_playlist,
+    add_to_playlist,
+    get_current_playlists,
+    get_playlist_tracks,
 ]
 
 def build_spotify_worker():

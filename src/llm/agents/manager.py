@@ -1,8 +1,9 @@
 """The Manager Agent for LangGraph.
 
-This acts as the Supervisor, delegating to the Spotify and GraphRAG sub-graphs.
+This acts as the Supervisor, delegating to the Spotify and BigQuery worker sub-graphs.
 """
 
+import datetime
 from typing import TypedDict, Annotated, List, Dict, Any
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, BaseMessage
 from langchain_core.tools import tool
@@ -16,11 +17,11 @@ from ..utils.config import get_gemini_llm
 
 # Import our worker builders
 from .spotify import build_spotify_worker
-from .graph_rag import build_graph_worker
+from .bigquery import build_bigquery_worker
 
 # 1. Build the sub-agents
 spotify_worker = build_spotify_worker()
-graph_worker = build_graph_worker()
+graph_worker = build_bigquery_worker()
 
 def _extract_text(content) -> str:
     """Helper to extract raw text from Gemini's list format if needed."""
@@ -49,15 +50,20 @@ def ask_spotify_worker(query: str) -> str:
     return _extract_text(result["messages"][-1].content)
 
 @tool
-def ask_graph_worker(query: str) -> str:
-    """Delegates a historical listening history task to the Graph RAG Worker.
-    Use this to find the user's top tracks, top artists, or query their personal music database.
-    
+def ask_bigquery_worker(query: str) -> str:
+    """Delegates a historical listening history task to the BigQuery Worker.
+    Use this to find the user's top tracks, top artists, or query their personal listening history database.
+
     Args:
         query: The specific question about the user's history (e.g., 'What is my most played song this month?').
     """
-    # Invoke the compiled sub-graph
-    result = graph_worker.invoke({"messages": [HumanMessage(content=query)]})
+    # Prepend the current UTC time and the active user_id so the graph worker
+    # can write correct SQL without needing a separate system message.
+    from auth.oauth_handler import current_user_id as spotify_user_ctx
+    current_time = datetime.datetime.now(datetime.timezone.utc).strftime("%A, %B %d, %Y %I:%M %p UTC")
+    user_id = spotify_user_ctx.get() or "UNKNOWN"
+    enriched_query = f"[Current date/time: {current_time}]\n[Active user_id: {user_id}]\n\n{query}"
+    result = graph_worker.invoke({"messages": [HumanMessage(content=enriched_query)]})
     return _extract_text(result["messages"][-1].content)
 
 @tool
@@ -88,7 +94,7 @@ def google_search(query: str) -> str:
         return f"Web search failed: {e}"
 
 # 3. Compile the Manager Agent
-manager_tools = [ask_spotify_worker, ask_graph_worker, google_search]
+manager_tools = [ask_spotify_worker, ask_bigquery_worker, google_search]
 
 def build_manager_agent():
     """Builds and returns the top-level Manager ReAct agent."""

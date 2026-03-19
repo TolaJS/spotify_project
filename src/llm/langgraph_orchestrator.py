@@ -1,4 +1,4 @@
-"""LangGraph Orchestrator - A stateful bridge between FastAPI, Neo4j, and the LangGraph Manager."""
+"""LangGraph Orchestrator - A stateful bridge between FastAPI and the LangGraph Manager."""
 
 import json
 import logging
@@ -11,8 +11,6 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, System
 # Import the main LangGraph agent
 from .agents.manager import build_manager_agent
 
-# Reuse the schemas and history DB from the old setup 
-# so we don't have to rewrite the WebSocket integration yet.
 from chatbot.schemas import Turn, Session, ChatResponse
 from chatbot.history_db import HistoryRepository
 from auth.oauth_handler import current_user_id as spotify_user_ctx
@@ -20,7 +18,7 @@ from auth.oauth_handler import current_user_id as spotify_user_ctx
 logger = logging.getLogger(__name__)
 
 class LangGraphOrchestrator:
-    """Manages multi-turn conversations using LangGraph and Neo4j memory."""
+    """Manages multi-turn conversations using LangGraph. Sessions are persisted to Firestore."""
 
     DEFAULT_TIMEOUT_SECONDS = 15 * 60  # 15 minutes
 
@@ -38,46 +36,62 @@ class LangGraphOrchestrator:
         self._history_repo = self._init_repo()
 
     def _init_repo(self):
-        import sys
         import os
         try:
-            # Add graph-rag to path since it has a dash in the folder name
-            sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../graph-rag')))
-            from neo4j_db import Neo4jDatabase
-            from llm.utils.config import get_neo4j_config
+            from google.cloud import firestore
+            project_id = os.environ.get("FIRESTORE_PROJECT_ID")
+            database_id = os.environ.get("FIRESTORE_DATABASE_ID", "tolajs-timber")
             
-            config = get_neo4j_config()
-            db = Neo4jDatabase(uri=config["uri"], auth=(config["user"], config["password"]))
-            db.connect()
-            return HistoryRepository(db)
+            if project_id:
+                client = firestore.Client(project=project_id, database=database_id)
+            else:
+                client = firestore.Client(database=database_id)
+                
+            return HistoryRepository(client)
         except Exception as e:
             logger.error(f"Failed to initialize HistoryRepository: {e}")
             return None
 
+    # Number of recent turns to keep in full (including tool data).
+    # Older turns have step_results stripped to reduce token usage.
+    _FULL_CONTEXT_TURNS = 5
+    # Hard cap on total turns sent to the LLM.
+    _MAX_TURNS = 20
+
     def _build_langgraph_messages(self, turns: list[Turn]) -> list:
-        """Converts chronological Session turns into LangChain BaseMessage objects."""
+        """Converts chronological Session turns into LangChain BaseMessage objects.
+
+        To keep token usage bounded:
+        - Only the most recent _FULL_CONTEXT_TURNS turns include step_results (raw tool data).
+        - Older turns retain the human/AI text only.
+        - Total history is capped at _MAX_TURNS turns.
+        """
+        # Apply hard cap — keep the most recent turns
+        capped = turns[-self._MAX_TURNS:] if len(turns) > self._MAX_TURNS else turns
+        full_start = max(0, len(capped) - self._FULL_CONTEXT_TURNS)
+
         messages = []
-        for turn in turns:
+        for i, turn in enumerate(capped):
+            include_tool_data = i >= full_start
+
             # 1. Add what the user said
             messages.append(HumanMessage(content=turn["query"]))
-            
-            # 2. Add the tool results if any (Context injection)
-            if turn.get("step_results"):
-                # We inject the hidden structured data back into the AI's context
+
+            # 2. Add tool results only for recent turns
+            if include_tool_data and turn.get("step_results"):
                 context_str = json.dumps(turn["step_results"])
-                # We format it as a generic tool message so the LLM accepts it as past context
                 messages.append(ToolMessage(
-                    content=context_str, 
-                    name="previous_context", 
+                    content=context_str,
+                    name="previous_context",
                     tool_call_id=f"ctx_{uuid.uuid4().hex[:8]}"
                 ))
-                
+
             # 3. Add what the AI said
             messages.append(AIMessage(content=turn["response"]))
-            
+
         return messages
 
-    def chat(self, query: str, session_id: Optional[str] = None, user_id: Optional[str] = None) -> ChatResponse:
+    def chat(self, query: str, session_id: Optional[str] = None, user_id: Optional[str] = None, timezone: Optional[str] = None) -> ChatResponse:
         """Process a user message using LangGraph."""
         self._cleanup_expired()
 
@@ -89,13 +103,35 @@ class LangGraphOrchestrator:
 
         # Build the exact message history array for LangGraph
         lg_messages = self._build_langgraph_messages(session["turns"])
-        
-        # Inject the absolute current time and the User ID into the prompt
+
+        # Compute the current time in the user's local timezone (sent by the browser).
+        # Falls back to UTC if the timezone is missing or unrecognised.
         import datetime
-        current_time = datetime.datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
-        uid_context = user_id if user_id else "kanljakm68dmhxs19itsmgbku"
-        
-        system_context = f"System Context:\n- The current date and time is exactly {current_time}.\n- The current active Spotify User ID is: {uid_context}."
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(timezone) if timezone else datetime.timezone.utc
+        except Exception:
+            tz = datetime.timezone.utc
+        current_time = datetime.datetime.now(tz).strftime("%A, %B %d, %Y %I:%M %p %Z")
+
+        # Fetch the user's display name from Spotify to personalise the context.
+        # Wrapped in try/except so a token hiccup never breaks the chat response.
+        display_name = None
+        if user_id:
+            try:
+                from auth.oauth_handler import get_spotify_client
+                sp = get_spotify_client(user_id)
+                display_name = sp.current_user().get("display_name")
+            except Exception:
+                pass
+
+        user_line = f"- The current active user's name is: {display_name}." if display_name else ""
+        system_context = (
+            f"System Context:\n"
+            f"- The current date and time is exactly {current_time}.\n"
+            f"- The current active Spotify User ID is: {user_id}.\n"
+            + (f"{user_line}\n" if user_line else "")
+        ).strip()
         lg_messages.append(SystemMessage(content=system_context))
         
         # Append the new user query
@@ -129,7 +165,7 @@ class LangGraphOrchestrator:
                 
             success = True
             
-            # Extract tool data to save to Neo4j as 'step_results'
+            # Extract tool data to save as 'step_results' for session context
             # (We look at the messages added during THIS turn, ignoring history)
             new_messages = result_state["messages"][len(lg_messages):]
             tool_outputs = []
@@ -174,7 +210,7 @@ class LangGraphOrchestrator:
         )
 
     def get_session(self, session_id: str) -> Optional[Session]:
-        """Get a session by ID. If not in memory, load from Neo4j."""
+        """Get a session by ID. If not in memory, load from Firestore."""
         session = self._sessions.get(session_id)
         if not session and self._history_repo:
             db_session = self._history_repo.load_session(session_id)
@@ -188,7 +224,7 @@ class LangGraphOrchestrator:
         return session
 
     def save_session_only(self, session_id: str, user_id: str = None) -> bool:
-        """Save session to Neo4j WITHOUT evicting it from memory.
+        """Save session to Firestore WITHOUT evicting it from memory.
         Used by the REST save endpoint so navigating away doesn't destroy
         the in-memory session context while the WebSocket may still be alive."""
         session = self._sessions.get(session_id)
@@ -197,7 +233,7 @@ class LangGraphOrchestrator:
         return False
 
     def close_session(self, session_id: str, user_id: str = None) -> bool:
-        """Evict session from memory and save to Neo4j. Called on true WS disconnect."""
+        """Evict session from memory and save to Firestore. Called on true WS disconnect."""
         session = self._sessions.pop(session_id, None)
         if session and user_id and self._history_repo:
             self._history_repo.save_session(user_id, session)
@@ -206,8 +242,6 @@ class LangGraphOrchestrator:
     def close(self):
         """Shut down the manager."""
         self._sessions.clear()
-        if self._history_repo and self._history_repo.db:
-            self._history_repo.db.close()
 
     # -- Private helpers --
 

@@ -18,15 +18,14 @@ class GlobalState(TypedDict):
         messages: The conversation history, including Human, AI, and Tool messages.
                   Uses `add_messages` to automatically append new messages rather than overwrite.
         step_results: A collected dictionary of raw, structured data returned by the worker agents.
-                      This replicates the old system's context gathering, allowing the wrapper
-                      to extract it and save it to Neo4j.
+                      Extracted by the orchestrator and saved to Firestore as session context.
     """
     messages: Annotated[list[BaseMessage], add_messages]
     step_results: Annotated[Dict[str, Any], merge_dict]
 
 
 class WorkerState(TypedDict):
-    """The state object passed to individual Worker Sub-Graphs (Spotify or Graph RAG).
+    """The state object passed to individual Worker Sub-Graphs (Spotify or BigQuery).
     
     Attributes:
         messages: The isolated thought process and tool calls for this specific task.

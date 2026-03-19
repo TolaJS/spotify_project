@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Dark background tile -->
+  <rect width="512" height="512" rx="114" fill="#121212"/>
+  <!-- Outer vinyl ring -->
+  <circle cx="256" cy="256" r="190" fill="#1DB954"/>
+  <!-- Mid groove ring -->
+  <circle cx="256" cy="256" r="140" fill="#0f9e45"/>
+  <!-- Inner groove ring -->
+  <circle cx="256" cy="256" r="90" fill="#1DB954"/>
+  <!-- Label centre -->
+  <circle cx="256" cy="256" r="55" fill="#121212"/>
+  <!-- Spindle hole -->
+  <circle cx="256" cy="256" r="18" fill="#1DB954"/>
+</svg>

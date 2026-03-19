@@ -1,0 +1,31 @@
+# Web framework
+fastapi==0.135.1
+uvicorn[standard]==0.40.0
+websockets==15.0.1
+
+# Data validation
+pydantic==2.11.7
+
+# Environment / config
+python-dotenv==1.2.1
+
+# Spotify
+spotipy==2.25.0
+
+# LLM / AI
+langchain==1.2.8
+langchain-core==1.2.8
+langchain-google-genai==4.2.0
+langgraph==1.0.7
+
+# Database
+google-cloud-bigquery==3.31.0
+
+# Google Cloud
+google-cloud-firestore==2.25.0
+google-cloud-storage==3.9.0
+
+# Utilities
+requests==2.32.4
+ijson==3.5.0
+python-multipart>=0.0.9
